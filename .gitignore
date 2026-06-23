@@ -1,0 +1,14 @@
+# Secrets — ne jamais committer
+.env
+
+# Environnement virtuel Python
+.venv/
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Fichiers système
+.DS_Store
+Thumbs.db

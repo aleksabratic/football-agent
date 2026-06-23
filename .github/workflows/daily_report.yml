@@ -1,0 +1,36 @@
+name: Agent Football — Rapport quotidien
+
+on:
+  # Déclenchement automatique chaque jour à minuit heure française (UTC+2 été = 22h UTC)
+  schedule:
+    - cron: '0 22 * * *'
+
+  # Déclenchement manuel depuis l'onglet "Actions" sur GitHub (pour tester)
+  workflow_dispatch:
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+
+      - name: Installation de Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Installation des dépendances
+        run: pip install -r requirements.txt
+
+      - name: Lancement de l'agent
+        run: python football_agent.py
+        env:
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          FOOTBALL_API_KEY:   ${{ secrets.FOOTBALL_API_KEY }}
+          ODDS_API_KEY:       ${{ secrets.ODDS_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
