@@ -1,9 +1,9 @@
 name: Agent Football — Rapport quotidien
 
 on:
-  # Déclenchement automatique chaque jour à minuit heure française (UTC+2 été = 22h UTC)
+  # Déclenchement automatique chaque jour à 8h heure française (UTC+2 été = 6h UTC)
   schedule:
-    - cron: '0 22 * * *'
+    - cron: '0 6 * * *'
 
   # Déclenchement manuel depuis l'onglet "Actions" sur GitHub (pour tester)
   workflow_dispatch:
