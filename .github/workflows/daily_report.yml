@@ -39,16 +39,18 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # Sans ce commit, le runner (éphémère) détruit l'historique des paris
-      # et le suivi ROI/yield/calibration est impossible.
-      - name: Sauvegarde de l'historique des paris
+      # Sans ce commit, le runner (éphémère) détruit les historiques
+      # (paris + Mon Petit Prono) et le suivi des performances est impossible.
+      - name: Sauvegarde des historiques (paris + MPP)
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add bet_history.csv bet_history_legacy.csv 2>/dev/null || git add bet_history.csv || true
+          for f in bet_history.csv mpp_history.csv bet_history_legacy.csv mpp_history_legacy.csv; do
+            [ -f "$f" ] && git add "$f"
+          done
           if ! git diff --staged --quiet; then
-            git commit -m "chore: mise à jour bet_history.csv [skip ci]"
+            git commit -m "chore: mise à jour des historiques (paris + MPP) [skip ci]"
             git pull --rebase origin main
             git push
           fi

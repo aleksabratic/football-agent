@@ -53,7 +53,7 @@ import time
 import logging
 import unicodedata
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from dotenv import load_dotenv
@@ -162,6 +162,13 @@ PERF_FIELDS = [
     "date", "fixture_id", "match", "marché", "pari", "cote", "bookmaker",
     "p_modèle_%", "p_marché_%", "p_finale_%", "edge_%", "ev_%", "mise_%",
     "résultat", "gain_unités", "clv",
+]
+
+# Historique des pronos Mon Petit Prono (réglés comme les paris)
+MPP_FILE = Path(__file__).parent / "mpp_history.csv"
+MPP_FIELDS = [
+    "date", "fixture_id", "match", "score_conseillé", "points_attendus",
+    "score_réel", "points", "résultat",
 ]
 
 _TZ_FR = ZoneInfo("Europe/Paris")
@@ -681,16 +688,40 @@ def _apply_exposure_cap(picks: list[dict], warnings: list[str]) -> list[dict]:
 #  SUIVI DES PERFORMANCES (CSV + SETTLEMENT)
 # ─────────────────────────────────────────────
 
-def _ensure_csv_schema() -> None:
+def _ensure_csv_schema(path: Path, fields: list[str]) -> None:
     """Si un ancien CSV avec un autre schéma existe, on l'archive."""
-    if not PERF_FILE.exists():
+    if not path.exists():
         return
-    with open(PERF_FILE, encoding="utf-8", newline="") as f:
+    with open(path, encoding="utf-8", newline="") as f:
         header = f.readline().strip()
-    if header != ",".join(PERF_FIELDS):
-        legacy = PERF_FILE.with_name("bet_history_legacy.csv")
-        PERF_FILE.rename(legacy)
+    if header != ",".join(fields):
+        legacy = path.with_name(path.stem + "_legacy.csv")
+        path.rename(legacy)
         logging.info(f"[Perf] Ancien schéma CSV archivé → {legacy.name}")
+
+
+def _read_history(path: Path, fields: list[str]) -> list[dict]:
+    _ensure_csv_schema(path, fields)
+    if not path.exists():
+        return []
+    with open(path, encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _append_history(path: Path, fields: list[str], rows: list[dict]) -> None:
+    needs_header = not path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        if needs_header:
+            w.writeheader()
+        w.writerows(rows)
+
+
+def _write_history(path: Path, fields: list[str], rows: list[dict]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
 
 
 def _log_bets_to_csv(date_str: str, match_label: str, fixture_id: int, bets: list[dict]) -> None:
@@ -698,35 +729,55 @@ def _log_bets_to_csv(date_str: str, match_label: str, fixture_id: int, bets: lis
     Enregistre chaque value bet dans bet_history.csv.
     résultat/gain_unités sont remplis automatiquement par settle_pending_bets().
     clv reste manuelle (cotes de clôture non fiables sur le plan Free).
+    Dédup sur (fixture_id, marché, pari) : un re-run ne double pas les lignes.
     """
     if not bets:
         return
-    _ensure_csv_schema()
-    needs_header = not PERF_FILE.exists()
-    with open(PERF_FILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=PERF_FIELDS)
-        if needs_header:
-            w.writeheader()
-        for bet in bets:
-            w.writerow({
-                "date":       date_str,
-                "fixture_id": fixture_id,
-                "match":      match_label,
-                "marché":     bet["marché"],
-                "pari":       bet["pari"],
-                "cote":       bet["cote"],
-                "bookmaker":  bet["bookmaker"],
-                "p_modèle_%": bet["p_modèle_%"],
-                "p_marché_%": bet["p_marché_%"],
-                "p_finale_%": bet["p_finale_%"],
-                "edge_%":     bet["edge_%"],
-                "ev_%":       bet["EV_%"],
-                "mise_%":     bet["mise_kelly_%"],
-                "résultat":   "",
-                "gain_unités": "",
-                "clv":        "",
-            })
-    logging.info(f"[Perf] {len(bets)} value bet(s) loggé(s) dans bet_history.csv")
+    existing = {
+        (r["fixture_id"], r["marché"], r["pari"])
+        for r in _read_history(PERF_FILE, PERF_FIELDS)
+    }
+    rows = [{
+        "date":        date_str,
+        "fixture_id":  fixture_id,
+        "match":       match_label,
+        "marché":      bet["marché"],
+        "pari":        bet["pari"],
+        "cote":        bet["cote"],
+        "bookmaker":   bet["bookmaker"],
+        "p_modèle_%":  bet["p_modèle_%"],
+        "p_marché_%":  bet["p_marché_%"],
+        "p_finale_%":  bet["p_finale_%"],
+        "edge_%":      bet["edge_%"],
+        "ev_%":        bet["EV_%"],
+        "mise_%":      bet["mise_kelly_%"],
+        "résultat":    "",
+        "gain_unités": "",
+        "clv":         "",
+    } for bet in bets if (str(fixture_id), bet["marché"], bet["pari"]) not in existing]
+    if rows:
+        _append_history(PERF_FILE, PERF_FIELDS, rows)
+        logging.info(f"[Perf] {len(rows)} value bet(s) loggé(s) dans bet_history.csv")
+
+
+def _log_mpp_to_csv(date_str: str, match_label: str, fixture_id: int, mpp: dict) -> None:
+    """Enregistre le prono Mon Petit Prono (1 par match, dédup sur fixture_id)."""
+    if not mpp:
+        return
+    existing = {r["fixture_id"] for r in _read_history(MPP_FILE, MPP_FIELDS)}
+    if str(fixture_id) in existing:
+        return
+    _append_history(MPP_FILE, MPP_FIELDS, [{
+        "date":            date_str,
+        "fixture_id":      fixture_id,
+        "match":           match_label,
+        "score_conseillé": mpp["score_conseillé"],
+        "points_attendus": mpp["points_attendus"],
+        "score_réel":      "",
+        "points":          "",
+        "résultat":        "",
+    }])
+    logging.info(f"[Perf] Prono MPP {mpp['score_conseillé']} loggé pour {match_label}")
 
 
 def _bet_won(marche: str, pari: str, gh: int, ga: int) -> bool:
@@ -740,24 +791,13 @@ def _bet_won(marche: str, pari: str, gh: int, ga: int) -> bool:
     return False
 
 
-def settle_pending_bets() -> str:
-    """
-    Règle les paris en attente : récupère les scores (90 min) des fixtures
-    terminées, remplit résultat + gain, et retourne un bilan texte
-    (jour réglé + cumul : ROI, yield, taux de réussite, Brier).
-    """
-    _ensure_csv_schema()
-    if not PERF_FILE.exists():
-        return ""
+def _sign(x: int) -> int:
+    return (x > 0) - (x < 0)
 
-    with open(PERF_FILE, encoding="utf-8", newline="") as f:
-        rows = list(csv.DictReader(f))
-    if not rows:
-        return ""
 
-    pending_ids = sorted({r["fixture_id"] for r in rows if not r["résultat"]})
+def _fetch_results(pending_ids: list[str]) -> dict[str, tuple]:
+    """Scores (90 min) des fixtures. L'endpoint accepte 20 ids par requête."""
     results: dict[str, tuple] = {}
-    # L'endpoint /fixtures accepte jusqu'à 20 ids par requête ("id-id-id")
     for i in range(0, len(pending_ids), 20):
         batch = pending_ids[i:i + 20]
         try:
@@ -770,16 +810,69 @@ def settle_pending_bets() -> str:
                 results[str(m["fixture"]["id"])] = (status, gh, ga)
         except Exception as e:
             logging.warning(f"[Perf] Settlement impossible pour le lot {batch}: {e}")
+    return results
 
-    settled_now = 0
-    profit_now  = 0.0
-    for r in rows:
-        if r["résultat"]:
+
+def _bet_stats(rows: list[dict]) -> str:
+    """Ligne de bilan pour un sous-ensemble de paris réglés."""
+    settled = [r for r in rows if r["résultat"] in ("gagné", "perdu")]
+    if not settled:
+        return ""
+    n      = len(settled)
+    wins   = sum(1 for r in settled if r["résultat"] == "gagné")
+    staked = sum(_f(r["mise_%"]) for r in settled)
+    profit = sum(_f(r["gain_unités"]) for r in settled)
+    yield_ = (profit / staked * 100) if staked else 0.0
+    brier  = sum(
+        (_f(r["p_finale_%"]) / 100 - (1.0 if r["résultat"] == "gagné" else 0.0)) ** 2
+        for r in settled
+    ) / n
+    return (
+        f"{n} paris réglés — {wins} gagnés ({wins / n * 100:.0f}%) · "
+        f"misé {staked:.1f}% · profit {profit:+.2f} pts de bankroll · "
+        f"yield {yield_:+.1f}% · Brier {brier:.3f}"
+    )
+
+
+def _mpp_stats(rows: list[dict]) -> str:
+    """Ligne de bilan pour un sous-ensemble de pronos MPP réglés."""
+    settled = [r for r in rows if r["résultat"] in ("score exact", "bon résultat", "raté")]
+    if not settled:
+        return ""
+    n     = len(settled)
+    exact = sum(1 for r in settled if r["résultat"] == "score exact")
+    good  = exact + sum(1 for r in settled if r["résultat"] == "bon résultat")
+    pts   = sum(_f(r["points"]) for r in settled)
+    return (
+        f"{n} pronos réglés — bon résultat {good / n * 100:.0f}% · "
+        f"score exact {exact / n * 100:.0f}% · {pts / n:.2f} pts/match "
+        f"(barème {MPP_PTS_RESULT}/{MPP_PTS_EXACT})"
+    )
+
+
+def settle_pending_bets() -> str:
+    """
+    Règle les paris ET les pronos Mon Petit Prono en attente (scores 90 min),
+    puis retourne un bilan texte : réglé ce matin + cumul, et le dimanche
+    un bilan hebdomadaire (paris + MPP sur les 7 derniers jours).
+    """
+    bet_rows = _read_history(PERF_FILE, PERF_FIELDS)
+    mpp_rows = _read_history(MPP_FILE, MPP_FIELDS)
+    if not bet_rows and not mpp_rows:
+        return ""
+
+    pending_ids = sorted(
+        {r["fixture_id"] for r in bet_rows if not r["résultat"]}
+        | {r["fixture_id"] for r in mpp_rows if not r["résultat"]}
+    )
+    results = _fetch_results(pending_ids) if pending_ids else {}
+
+    # ── Paris ─────────────────────────────────────────────────────
+    settled_now, profit_now = 0, 0.0
+    for r in bet_rows:
+        if r["résultat"] or r["fixture_id"] not in results:
             continue
-        res = results.get(r["fixture_id"])
-        if not res:
-            continue
-        status, gh, ga = res
+        status, gh, ga = results[r["fixture_id"]]
         if status in ("CANC", "ABD"):
             r["résultat"], r["gain_unités"] = "annulé", "0.0"
             continue
@@ -796,31 +889,59 @@ def settle_pending_bets() -> str:
         settled_now += 1
         profit_now  += _f(r["gain_unités"])
 
-    with open(PERF_FILE, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=PERF_FIELDS)
-        w.writeheader()
-        w.writerows(rows)
+    # ── Mon Petit Prono ───────────────────────────────────────────
+    for r in mpp_rows:
+        if r["résultat"] or r["fixture_id"] not in results:
+            continue
+        status, gh, ga = results[r["fixture_id"]]
+        if status in ("CANC", "ABD"):
+            r["résultat"] = "annulé"
+            continue
+        if status not in ("FT", "AET", "PEN") or gh is None or ga is None:
+            continue
+        gh, ga = int(gh), int(ga)
+        r["score_réel"] = f"{gh}-{ga}"
+        try:
+            ph, pa = (int(x) for x in r["score_conseillé"].split("-"))
+        except ValueError:
+            r["résultat"] = "annulé"
+            continue
+        if (ph, pa) == (gh, ga):
+            r["résultat"], r["points"] = "score exact", str(MPP_PTS_EXACT)
+        elif _sign(ph - pa) == _sign(gh - ga):
+            r["résultat"], r["points"] = "bon résultat", str(MPP_PTS_RESULT)
+        else:
+            r["résultat"], r["points"] = "raté", "0"
 
-    # ── Bilan cumulé ──────────────────────────────────────────────
-    settled = [r for r in rows if r["résultat"] in ("gagné", "perdu")]
-    if not settled:
-        return ""
-    n       = len(settled)
-    wins    = sum(1 for r in settled if r["résultat"] == "gagné")
-    staked  = sum(_f(r["mise_%"]) for r in settled)
-    profit  = sum(_f(r["gain_unités"]) for r in settled)
-    yield_  = (profit / staked * 100) if staked else 0.0
-    brier   = sum(
-        (_f(r["p_finale_%"]) / 100 - (1.0 if r["résultat"] == "gagné" else 0.0)) ** 2
-        for r in settled
-    ) / n
-    lines = [
-        f"Paris réglés (cumul) : {n} — {wins} gagnés ({wins / n * 100:.0f}%)",
-        f"Total misé : {staked:.1f}% de bankroll · Profit net : {profit:+.2f} points de bankroll",
-        f"Yield : {yield_:+.1f}% · Brier (calibration, plus bas = mieux) : {brier:.3f}",
-    ]
+    if bet_rows:
+        _write_history(PERF_FILE, PERF_FIELDS, bet_rows)
+    if mpp_rows:
+        _write_history(MPP_FILE, MPP_FIELDS, mpp_rows)
+
+    # ── Bilan texte ───────────────────────────────────────────────
+    lines: list[str] = []
     if settled_now:
-        lines.insert(0, f"Nouveaux paris réglés ce matin : {settled_now} → {profit_now:+.2f} points de bankroll")
+        lines.append(f"Nouveaux paris réglés ce matin : {settled_now} → {profit_now:+.2f} pts de bankroll")
+    if (s := _bet_stats(bet_rows)):
+        lines.append(f"Paris (cumul) : {s}")
+    if (s := _mpp_stats(mpp_rows)):
+        lines.append(f"Mon Petit Prono (cumul) : {s}")
+
+    # Dimanche : bilan hebdomadaire sur les 7 derniers jours
+    today = _now_fr().date()
+    if today.weekday() == 6:
+        week_start = (today - timedelta(days=6)).isoformat()
+        week_bets  = [r for r in bet_rows if r["date"] >= week_start]
+        week_mpp   = [r for r in mpp_rows if r["date"] >= week_start]
+        week_lines = []
+        if (s := _bet_stats(week_bets)):
+            week_lines.append(f"Paris : {s}")
+        if (s := _mpp_stats(week_mpp)):
+            week_lines.append(f"Mon Petit Prono : {s}")
+        if week_lines:
+            lines.append(f"BILAN HEBDO (semaine du {week_start} au {today.isoformat()}) :")
+            lines.extend("  " + wl for wl in week_lines)
+
     return "\n".join(lines)
 
 
@@ -1060,9 +1181,11 @@ def get_match_analysis(
                 "différents — seuils de value doublés, confiance réduite."
             )
 
-    # Log automatique pour suivi performances
+    # Log automatique pour suivi performances (paris + prono MPP)
     match_label = f"{home_team} vs {away_team}" if home_team else str(fixture_id)
-    _log_bets_to_csv(_now_fr().date().isoformat(), match_label, fixture_id, value_bets)
+    today_iso   = _now_fr().date().isoformat()
+    _log_bets_to_csv(today_iso, match_label, fixture_id, value_bets)
+    _log_mpp_to_csv(today_iso, match_label, fixture_id, mpp)
 
     return json.dumps({
         "forme":                forme,
@@ -1261,8 +1384,12 @@ FORMAT DU RAPPORT (HTML strict, Telegram)
 
 [Si un bilan de performance est fourni dans le message initial :]
 📈 <b>BILAN DU MODÈLE</b>
-[Recopie les chiffres du bilan en 2-3 lignes claires : paris réglés, taux de réussite,
- profit/yield. Si le yield est négatif, dis-le honnêtement.]
+[Recopie fidèlement les chiffres fournis, en lignes claires :
+ • Paris : nombre réglé, % gagnés, profit, yield (si le yield est négatif, dis-le honnêtement)
+ • Mon Petit Prono : % de bons résultats, % de scores exacts, points par match
+ N'affiche PAS le score de Brier (indicateur interne).
+ Si une partie "BILAN HEBDO" est fournie (le dimanche), présente-la dans un sous-bloc
+ distinct "📅 <b>Bilan de la semaine</b>" avec les mêmes règles.]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
