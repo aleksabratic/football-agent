@@ -12,6 +12,8 @@ Architecture de décision :
       * Shrinkage vers le prior de ligue quand l'échantillon est petit
       * Correction Dixon-Coles (ρ) : corrige la sous-estimation des nuls
         du Poisson indépendant
+      * Matchs internationaux : λ ancrés à 70 % sur le classement Elo
+        mondial (eloratings.net), bonus pays hôte WC 2026 (USA/MEX/CAN)
   - Marché :
       * Bookmaker de référence (Pinnacle si dispo) dévigué par la
         méthode "power" (moins biaisée que la multiplicative)
@@ -49,6 +51,7 @@ import json
 import math
 import time
 import logging
+import unicodedata
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -116,6 +119,27 @@ MAX_MATCHES_PER_LEAGUE = 3  # hors Coupe du Monde (WC = tous les matchs)
 # ── Mon Petit Prono (barème par défaut : ajuster selon ta ligue) ──
 MPP_PTS_RESULT = 1   # points pour le bon résultat (1/N/2)
 MPP_PTS_EXACT  = 3   # points pour le score exact (inclut le bon résultat)
+
+# ── Elo des sélections nationales (eloratings.net) ──────────────
+# Pour les matchs internationaux, 4-5 matchs de stats API sont du bruit :
+# l'Elo (historique complet pondéré par la force des adversaires) est
+# beaucoup plus fiable. Les λ finaux = blend Elo / stats.
+ELO_RATINGS_URL  = "https://www.eloratings.net/World.tsv"
+ELO_NAMES_URL    = "https://www.eloratings.net/en.teams.tsv"
+ELO_HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+ELO_WEIGHT       = 0.70  # poids de l'Elo dans les buts attendus (internationaux)
+ELO_HOST_BONUS   = 80    # WC 2026 : USA/Mexique/Canada jouent réellement chez eux
+ELO_HOST_NATIONS = {"usa", "united states", "mexico", "canada"}
+# Noms API-Football → noms eloratings (formes normalisées) pour les cas ambigus
+ELO_ALIASES = {
+    "usa":                  "united states",
+    "ivory coast":          "cote divoire",
+    "czech republic":       "czechia",
+    "cape verde islands":   "cape verde",
+    "turkiye":              "turkey",
+    "korea republic":       "south korea",
+    "ir iran":              "iran",
+}
 
 # ── Bookmakers de référence pour le devig (ordre de préférence) ──
 # Pinnacle = marché le plus efficient ; sinon Bet365 / Marathonbet / 1xBet
@@ -330,6 +354,144 @@ def _matrix_markets(m: list[list[float]]) -> dict:
         key=lambda x: x["probabilité_%"], reverse=True,
     )[:5]
     return {"p1": p1, "px": px, "p2": p2, "over25": over25, "btts": btts, "top_scores": top}
+
+
+# ─────────────────────────────────────────────
+#  ELO SÉLECTIONS NATIONALES (eloratings.net)
+# ─────────────────────────────────────────────
+
+_ELO_CACHE: dict | None = None  # nom normalisé → (elo, rang mondial)
+
+
+def _normalize_team(name: str) -> str:
+    """Minuscules, sans accents ni ponctuation — pour matcher les deux sources."""
+    s = unicodedata.normalize("NFD", name)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = re.sub(r"[^a-z0-9 ]", "", s.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _load_elo() -> dict:
+    """
+    Charge les classements Elo (1 seule fois par run, hors quota API-Football).
+    World.tsv : rang \\t rang \\t code \\t elo \\t ...
+    en.teams.tsv : code \\t nom principal \\t alias...
+    En cas d'échec réseau → {} : le moteur retombe sur les stats seules.
+    """
+    global _ELO_CACHE
+    if _ELO_CACHE is not None:
+        return _ELO_CACHE
+    try:
+        r_names = requests.get(ELO_NAMES_URL, headers=ELO_HTTP_HEADERS, timeout=15)
+        r_names.raise_for_status()
+        r_names.encoding = "utf-8"
+        code_names: dict[str, list[str]] = {}
+        for line in r_names.text.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                code_names[parts[0]] = [p for p in parts[1:] if p]
+
+        r_elo = requests.get(ELO_RATINGS_URL, headers=ELO_HTTP_HEADERS, timeout=15)
+        r_elo.raise_for_status()
+        r_elo.encoding = "utf-8"
+        table: dict[str, tuple[int, int]] = {}
+        for line in r_elo.text.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 4:
+                continue
+            try:
+                rank, code, elo = int(parts[0]), parts[2], int(parts[3])
+            except ValueError:
+                continue
+            for name in code_names.get(code, []):
+                table[_normalize_team(name)] = (elo, rank)
+        _ELO_CACHE = table
+        logging.info(f"[Elo] {len(table)} noms d'équipes chargés depuis eloratings.net")
+    except Exception as e:
+        logging.warning(f"[Elo] Chargement impossible : {e}")
+        _ELO_CACHE = {}
+    return _ELO_CACHE
+
+
+def _elo_lookup(team_name: str) -> tuple[int, int] | None:
+    """(elo, rang mondial) pour une équipe, ou None si introuvable."""
+    table = _load_elo()
+    if not table or not team_name:
+        return None
+    key = _normalize_team(team_name)
+    # Lookup direct d'abord, alias en secours seulement
+    return table.get(key) or table.get(ELO_ALIASES.get(key, ""))
+
+
+def _elo_expected_lambdas(elo_h: int, elo_a: int, total_goals: float) -> tuple[float, float]:
+    """
+    Convertit un écart d'Elo en buts attendus, en cohérence avec notre propre
+    matrice Dixon-Coles : on cherche par dichotomie l'écart de buts qui donne
+    une espérance de victoire (P(V) + P(N)/2) égale à celle prédite par l'Elo.
+    Le total de buts reste celui du prior de compétition.
+    """
+    target = 1.0 / (1.0 + 10 ** (-(elo_h - elo_a) / 400.0))
+    lo, hi = -3.0, 3.0
+    lam_h = lam_a = total_goals / 2.0
+    for _ in range(30):
+        mid   = (lo + hi) / 2.0
+        lam_h = max(0.15, (total_goals + mid) / 2.0)
+        lam_a = max(0.15, (total_goals - mid) / 2.0)
+        mk    = _matrix_markets(_score_matrix(lam_h, lam_a))
+        if mk["p1"] + mk["px"] / 2.0 < target:
+            lo = mid
+        else:
+            hi = mid
+    return round(lam_h, 3), round(lam_a, 3)
+
+
+def _apply_elo(
+    lam_h: float, lam_a: float,
+    home_team: str, away_team: str,
+    league_id: int,
+) -> tuple[float, float, dict, list[str]]:
+    """
+    Matchs internationaux : blend λ = 70 % Elo + 30 % stats.
+    Bonus hôte WC 2026 (USA/Mexique/Canada : vrais matchs à domicile).
+    Si l'Elo est indisponible pour une équipe → stats seules + avertissement.
+    """
+    warnings: list[str] = []
+    eh = _elo_lookup(home_team)
+    ea = _elo_lookup(away_team)
+    if not eh or not ea:
+        missing = [t for t, e in [(home_team, eh), (away_team, ea)] if not e]
+        warnings.append(
+            f"Classement Elo introuvable pour {', '.join(missing)} — "
+            "modèle basé sur les stats seules, fiabilité réduite."
+        )
+        return lam_h, lam_a, {}, warnings
+
+    elo_h, rank_h = eh
+    elo_a, rank_a = ea
+    is_host = _normalize_team(home_team) in ELO_HOST_NATIONS
+    elo_h_eff = elo_h + (ELO_HOST_BONUS if is_host else 0)
+
+    avg_h, avg_a = LEAGUE_GOALS.get(league_id, (1.30, 1.20))
+    lam_elo_h, lam_elo_a = _elo_expected_lambdas(elo_h_eff, elo_a, avg_h + avg_a)
+    mk_elo = _matrix_markets(_score_matrix(lam_elo_h, lam_elo_a))
+
+    blended_h = round(ELO_WEIGHT * lam_elo_h + (1.0 - ELO_WEIGHT) * lam_h, 3)
+    blended_a = round(ELO_WEIGHT * lam_elo_a + (1.0 - ELO_WEIGHT) * lam_a, 3)
+
+    elo_block = {
+        "elo_dom":            elo_h,
+        "rang_mondial_dom":   rank_h,
+        "elo_ext":            elo_a,
+        "rang_mondial_ext":   rank_a,
+        "bonus_hôte_appliqué": is_host,
+        "p_1x2_selon_elo_%": {
+            "1": round(mk_elo["p1"] * 100, 1),
+            "X": round(mk_elo["px"] * 100, 1),
+            "2": round(mk_elo["p2"] * 100, 1),
+        },
+        "poids_elo_dans_le_modèle": ELO_WEIGHT,
+    }
+    return blended_h, blended_a, elo_block, warnings
 
 
 # ─────────────────────────────────────────────
@@ -746,6 +908,7 @@ def get_match_analysis(
     h2h_list: list = []
     model_block: dict = {}
     mpp: dict = {}
+    elo_block: dict = {}
     matrix = None
     mk: dict = {}
     home_s = away_s = None
@@ -803,6 +966,14 @@ def get_match_analysis(
         ]
 
         lam_h, lam_a, strengths = _expected_goals(home_s, away_s, league_id, is_neutral_venue)
+
+        # Matchs internationaux : les stats sont bruitées → ancrage sur l'Elo
+        if league_id in NEUTRAL_LEAGUES:
+            lam_h, lam_a, elo_block, elo_warns = _apply_elo(
+                lam_h, lam_a, home_team, away_team, league_id
+            )
+            warnings.extend(elo_warns)
+
         matrix = _score_matrix(lam_h, lam_a)
         mk     = _matrix_markets(matrix)
 
@@ -878,10 +1049,16 @@ def get_match_analysis(
             "— estimation fortement régularisée vers la moyenne de ligue."
         )
     if is_neutral_venue:
-        warnings.append(
-            "Match international : les stats mélangent des adversaires de niveaux très "
-            "différents — seuils de value doublés, confiance réduite."
-        )
+        if elo_block:
+            warnings.append(
+                "Match international : modèle ancré sur le classement Elo mondial "
+                "(70 %), stats récentes en appoint — seuils de value doublés par prudence."
+            )
+        else:
+            warnings.append(
+                "Match international : les stats mélangent des adversaires de niveaux très "
+                "différents — seuils de value doublés, confiance réduite."
+            )
 
     # Log automatique pour suivi performances
     match_label = f"{home_team} vs {away_team}" if home_team else str(fixture_id)
@@ -890,6 +1067,7 @@ def get_match_analysis(
     return json.dumps({
         "forme":                forme,
         "h2h":                  h2h_list,
+        "elo":                  elo_block,
         "modèle":               model_block,
         "bookmaker_référence":  ref_name,
         "marchés":              market_info,
@@ -957,7 +1135,8 @@ TOOLS = [
         "name": "get_match_analysis",
         "description": (
             "Analyse complète orientée value betting. Retourne : forme (saison avec splits "
-            "domicile/extérieur + 5 derniers matchs), H2H (faible poids prédictif), "
+            "domicile/extérieur + 5 derniers matchs), elo (matchs internationaux : classement "
+            "Elo mondial des deux équipes, base principale du modèle), H2H (faible poids prédictif), "
             "probabilités du modèle (1X2, Over/Under 2.5, BTTS, scores les plus probables), "
             "marchés déviggés, probabilités finales (blend marché/modèle), value_bets, "
             "et mon_petit_prono (score conseillé + points attendus). "
@@ -1105,6 +1284,10 @@ Pour CHAQUE match, reproduis exactement cette structure :
   • [Éq. B] : saison à l'extérieur [x] buts marqués / [x] encaissés par match — 5 derniers : [x] marqués, [x] encaissés
   [Sur terrain neutre (WC) : utilise les stats "total" saison, sans mention domicile/extérieur]
 
+[Si le champ "elo" est présent (matchs internationaux) :]
+🌍 <b>Classement Elo mondial :</b> [Éq. A] [rang]e ([elo] pts) · [Éq. B] [rang]e ([elo] pts)
+[Si bonus_hôte_appliqué est true, ajoute : <i>(avantage du pays hôte pris en compte)</i>]
+
 🔢 <b>Notre estimation finale :</b>
   • Victoire [Éq. A] : <b>[X]%</b>   ← bookmakers donnent [X]%
   • Match nul : <b>[X]%</b>           ← bookmakers donnent [X]%
@@ -1118,6 +1301,9 @@ Pour CHAQUE match, reproduis exactement cette structure :
 [OBLIGATOIRE — 4 à 6 phrases en langage naturel, précises et chiffrées. Tu dois expliquer :
  1. Quelle équipe est la plus solide sur la SAISON (avec les splits domicile/extérieur)
     et laquelle arrive en meilleure forme récente — cite les chiffres.
+    Pour les matchs internationaux : le classement Elo mondial est l'argument de force
+    PRINCIPAL (notre modèle s'appuie dessus à 70 %), les stats récentes viennent en appoint.
+    Mentionne l'avantage du pays hôte s'il s'applique.
  2. Le profil de buts attendu : match ouvert ou fermé ? (buts attendus, % over 2.5).
  3. Ce que voit notre modèle : y a-t-il un écart avec les bookmakers ? Sur quelle issue,
     et pourquoi c'est potentiellement intéressant.
@@ -1170,7 +1356,8 @@ CONSIGNES DE RÉDACTION
 - En Coupe du Monde à élimination directe : précise que nos probabilités portent sur
   le temps réglementaire (90 minutes)
 - Évite tout jargon : pas de "lambda", "shrinkage", "EV", "edge", "blend", "devig",
-  "Dixon-Coles", "Kelly" dans le rapport final
+  "Dixon-Coles", "Kelly" dans le rapport final. Exception : "classement Elo mondial"
+  est autorisé (compréhensible par tous, comme un classement FIFA)
 - Le paragraphe Analyse est OBLIGATOIRE pour chaque match — c'est la valeur ajoutée principale
 - Sois direct et factuel, évite les formulations vagues ("match équilibré", "tout est possible")
 - Reste sous ~1000 mots de rapport pour tenir dans les limites Telegram
