@@ -1,17 +1,22 @@
 name: Agent Football — Rapport quotidien
 
 on:
-  # Déclenchement automatique chaque jour à 8h heure française (UTC+2 été = 6h UTC)
+  # Déclenchement automatique chaque jour à 8h heure française d'été (6h UTC).
+  # NB : en hiver (UTC+1), ce cron correspond à 7h — ajuster à '0 7 * * *' si besoin.
   schedule:
     - cron: '0 6 * * *'
 
   # Déclenchement manuel depuis l'onglet "Actions" sur GitHub (pour tester)
   workflow_dispatch:
 
+# Nécessaire pour committer bet_history.csv (suivi des performances)
+permissions:
+  contents: write
+
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Récupération du code
@@ -33,3 +38,17 @@ jobs:
           APIFOOTBALL_KEY:    ${{ secrets.APIFOOTBALL_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # Sans ce commit, le runner (éphémère) détruit l'historique des paris
+      # et le suivi ROI/yield/calibration est impossible.
+      - name: Sauvegarde de l'historique des paris
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bet_history.csv bet_history_legacy.csv 2>/dev/null || git add bet_history.csv || true
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: mise à jour bet_history.csv [skip ci]"
+            git pull --rebase origin main
+            git push
+          fi

@@ -1,14 +1,32 @@
 """
 ============================================================
  AGENT IA — PRONOSTICS FOOT (VALUE BETTING)
- (API-Football api-sports.io — plan Free 100 req/jour)
+ (API-Football api-sports.io — plan Free 100 req/jour, 10 req/min)
 ============================================================
 
 Architecture de décision :
-  - Moteur probabiliste en Python (Poisson forces relatives + shrinkage)
-  - Dévigging des cotes (marge bookmaker retirée)
-  - Pick uniquement si edge > 3% ET EV > 4% (sinon "Aucune valeur")
-  - Mise = Kelly/4 (proportionnel à l'avantage détecté)
+  - Moteur probabiliste en Python :
+      * Forces d'attaque/défense sur les stats SAISON avec splits
+        domicile/extérieur (fournies par /predictions, zéro requête en plus)
+      * Ajustement de forme récente (5 derniers matchs, ±15 % max)
+      * Shrinkage vers le prior de ligue quand l'échantillon est petit
+      * Correction Dixon-Coles (ρ) : corrige la sous-estimation des nuls
+        du Poisson indépendant
+  - Marché :
+      * Bookmaker de référence (Pinnacle si dispo) dévigué par la
+        méthode "power" (moins biaisée que la multiplicative)
+      * Meilleure cote disponible parmi tous les books pour l'EV
+  - Probabilité finale = blend 65 % marché / 35 % modèle
+    (le marché sert de prior : on ne parie que si le désaccord résiduel
+     survit au blend)
+  - Marchés couverts : 1X2, Over/Under 2.5, BTTS
+  - Pick uniquement si edge ≥ 2 % ET EV ≥ 3 % (seuils doublés en Coupe
+    du Monde : stats internationales peu fiables)
+  - Mise = Kelly/4, plafonnée à 2 % par pari et 8 % par jour
+  - Suivi : bet_history.csv (commité par le workflow GitHub), settlement
+    automatique des paris en attente à chaque run + bilan (ROI, yield,
+    Brier) injecté dans le rapport
+  - Mon Petit Prono : score conseillé maximisant les points attendus
   - Claude s'occupe uniquement du formatage du rapport
 
 Variables d'environnement (.env) :
@@ -26,12 +44,14 @@ sys.stderr.reconfigure(encoding="utf-8")
 
 import csv
 import os
+import re
 import json
 import math
 import time
 import logging
 import requests
-from datetime import datetime, date, timezone, timedelta
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from dotenv import load_dotenv
 import anthropic
@@ -76,25 +96,78 @@ LEAGUE_GOALS: dict[int, tuple[float, float]] = {
     61:  (1.40, 1.15),  # Ligue 1
 }
 
-# Seuils value betting
-EDGE_THRESHOLD = 0.03   # avantage minimum sur le marché (3 %)
-EV_THRESHOLD   = 0.04   # espérance de gain minimum (4 %)
-KELLY_FRACTION = 0.25   # quart de Kelly pour limiter la variance
+# ── Modèle ────────────────────────────────────
+RHO           = -0.10   # correction Dixon-Coles (gonfle 0-0 / 1-1, dégonfle 1-0 / 0-1)
+MARKET_WEIGHT = 0.65    # poids du marché dans la proba finale (le modèle pèse 35 %)
+FORM_CLAMP    = 0.15    # ajustement max de la forme récente (±15 %)
+
+# ── Value betting ─────────────────────────────
+EDGE_THRESHOLD    = 0.02   # avantage minimum APRÈS blend marché/modèle (2 %)
+EV_THRESHOLD      = 0.03   # espérance de gain minimum (3 %)
+WC_THRESHOLD_MULT = 2.0    # seuils doublés en Coupe du Monde (stats peu fiables)
+KELLY_FRACTION    = 0.25   # quart de Kelly pour limiter la variance
+MAX_STAKE_PER_BET = 0.02   # 2 % de bankroll max par pari
+DAILY_EXPOSURE_CAP = 0.08  # 8 % de bankroll max engagés par jour
+
+# ── Sélection des matchs (budget 100 req/jour, 2 req/match) ──
+MAX_MATCHES_PER_DAY   = 15
+MAX_MATCHES_PER_LEAGUE = 3  # hors Coupe du Monde (WC = tous les matchs)
+
+# ── Mon Petit Prono (barème par défaut : ajuster selon ta ligue) ──
+MPP_PTS_RESULT = 1   # points pour le bon résultat (1/N/2)
+MPP_PTS_EXACT  = 3   # points pour le score exact (inclut le bon résultat)
+
+# ── Bookmakers de référence pour le devig (ordre de préférence) ──
+# Pinnacle = marché le plus efficient ; sinon Bet365 / Marathonbet / 1xBet
+PREFERRED_BOOKMAKER_IDS = [4, 8, 2, 11]
+
+# Marchés suivis : nom API → (label interne, mapping sélection API → sélection interne)
+MARKETS_MAP = {
+    "Match Winner":     ("1X2",     {"Home": "1", "Draw": "X", "Away": "2"}),
+    "Goals Over/Under": ("O/U 2.5", {"Over 2.5": "Over", "Under 2.5": "Under"}),
+    "Both Teams Score": ("BTTS",    {"Yes": "Oui", "No": "Non"}),
+}
+MARKET_SELECTIONS = {
+    "1X2":     ["1", "X", "2"],
+    "O/U 2.5": ["Over", "Under"],
+    "BTTS":    ["Oui", "Non"],
+}
 
 PERF_FILE = Path(__file__).parent / "bet_history.csv"
-_TZ_FR    = timezone(timedelta(hours=2))
-MODEL     = "claude-opus-4-8"
-client    = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+PERF_FIELDS = [
+    "date", "fixture_id", "match", "marché", "pari", "cote", "bookmaker",
+    "p_modèle_%", "p_marché_%", "p_finale_%", "edge_%", "ev_%", "mise_%",
+    "résultat", "gain_unités", "clv",
+]
+
+_TZ_FR = ZoneInfo("Europe/Paris")
+MODEL  = "claude-opus-4-8"
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Exposition cumulée sur la journée (réinitialisée à chaque run)
+_RUN_EXPOSURE = 0.0
 
 
 # ─────────────────────────────────────────────
 #  HELPER API
 # ─────────────────────────────────────────────
 
+_last_api_call = 0.0
+
+def _throttle() -> None:
+    """Plan Free = 10 req/min → au moins 6,5 s entre deux appels."""
+    global _last_api_call
+    wait = 6.5 - (time.monotonic() - _last_api_call)
+    if wait > 0:
+        time.sleep(wait)
+    _last_api_call = time.monotonic()
+
+
 def _api_get(endpoint: str, params: dict = None) -> list:
     url   = f"{APIFOOTBALL_BASE}/{endpoint}"
-    delay = 5
+    delay = 10
     for attempt in range(4):
+        _throttle()
         resp = requests.get(url, headers=APIFOOTBALL_HEADERS, params=params or {}, timeout=15)
         if resp.status_code == 429:
             if attempt < 3:
@@ -102,20 +175,31 @@ def _api_get(endpoint: str, params: dict = None) -> list:
                 time.sleep(delay)
                 delay *= 2
                 continue
+            # Ne JAMAIS retourner [] en silence : le rapport dirait
+            # "aucun match" alors que l'API est en panne.
+            raise RuntimeError(f"API-Football : rate limit persistant sur /{endpoint}")
         resp.raise_for_status()
         data = resp.json()
         if data.get("errors"):
-            raise RuntimeError(f"API errors: {data['errors']}")
+            raise RuntimeError(f"API errors sur /{endpoint}: {data['errors']}")
         return data.get("response", [])
-    return []
+    raise RuntimeError(f"API-Football : échec répété sur /{endpoint}")
 
 
-def _ts_to_fr(ts: int) -> str:
-    return datetime.fromtimestamp(ts, tz=_TZ_FR).strftime("%H:%M")
+def _f(x, default: float = 0.0) -> float:
+    """Conversion float tolérante (l'API renvoie des strings, parfois null)."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
+def _now_fr() -> datetime:
+    return datetime.now(tz=_TZ_FR)
 
 
 # ─────────────────────────────────────────────
-#  MOTEUR POISSON (forces relatives + shrinkage)
+#  MOTEUR POISSON + DIXON-COLES
 # ─────────────────────────────────────────────
 
 def _poisson_prob(lam: float, k: int) -> float:
@@ -129,145 +213,336 @@ def _shrink(observed: float, n_games: int, prior: float = 1.0) -> float:
     Régresse la force observée vers le prior (1.0 = moyenne de ligue).
     Avec n_games=3 → 30% données réelles, 70% prior.
     Avec n_games=10+ → 100% données réelles.
-    Évite qu'un 2.3 buts/match sur 3 matchs hallucine un grand favori.
+    Évite qu'un petit échantillon hallucine un grand favori.
     """
     w = min(n_games, 10) / 10.0
     return w * observed + (1.0 - w) * prior
 
 
-def _relative_poisson(
-    h_avg_for: float, h_avg_ag: float,
-    a_avg_for: float, a_avg_ag: float,
-    h_played: int, a_played: int,
-    league_id: int, is_neutral: bool,
-) -> tuple[float, float]:
+def _form_factor(l5_played: int, l5_gf_avg: float, season_gf_avg: float) -> float:
     """
-    Calcule les buts attendus (λ) via forces relatives.
-
-    Force d'attaque  = buts marqués / équipe / moyenne de la compétition
-    Force de défense = buts encaissés / équipe / moyenne de la compétition
-    λ_dom = att_dom × def_ext × moyenne_buts_domicile_compétition
-    λ_ext = att_ext × def_dom × moyenne_buts_extérieur_compétition
-
-    Sur terrain neutre (WC) : même base de référence pour les deux équipes.
+    Ajustement de forme : ratio buts/match sur les 5 derniers vs la saison,
+    clampé à ±15 % et pondéré par le nombre de matchs récents disponibles.
     """
-    avg_h, avg_a = LEAGUE_GOALS.get(league_id, (1.40, 1.15))
-    overall_avg  = (avg_h + avg_a) / 2.0
-
-    # Forces brutes (ratio vs moyenne globale de la ligue)
-    att_h_raw = h_avg_for / overall_avg if overall_avg > 0 else 1.0
-    def_h_raw = h_avg_ag  / overall_avg if overall_avg > 0 else 1.0
-    att_a_raw = a_avg_for / overall_avg if overall_avg > 0 else 1.0
-    def_a_raw = a_avg_ag  / overall_avg if overall_avg > 0 else 1.0
-
-    # Shrinkage : revenir vers 1.0 proportionnellement au manque de données
-    att_h = _shrink(att_h_raw, h_played)
-    def_h = _shrink(def_h_raw, h_played)
-    att_a = _shrink(att_a_raw, a_played)
-    def_a = _shrink(def_a_raw, a_played)
-
-    if is_neutral:
-        lam_home = att_h * def_a * overall_avg
-        lam_away = att_a * def_h * overall_avg
-    else:
-        lam_home = att_h * def_a * avg_h * 1.10  # légère prime domicile
-        lam_away = att_a * def_h * avg_a
-
-    return round(lam_home, 3), round(lam_away, 3)
+    if l5_played < 3 or season_gf_avg <= 0.2:
+        return 1.0
+    ratio = max(1.0 - FORM_CLAMP, min(1.0 + FORM_CLAMP, l5_gf_avg / season_gf_avg))
+    w = min(l5_played, 5) / 5.0
+    return 1.0 + w * (ratio - 1.0)
 
 
-def _poisson_1x2(lam_home: float, lam_away: float) -> tuple[float, float, float]:
-    """Intègre la matrice des scores Poisson pour obtenir les probas 1X2."""
-    p_dom = p_nul = p_ext = 0.0
-    for g1 in range(10):
-        for g2 in range(10):
-            p = _poisson_prob(lam_home, g1) * _poisson_prob(lam_away, g2)
-            if   g1 > g2: p_dom += p
-            elif g1 == g2: p_nul += p
-            else:          p_ext += p
-    return p_dom, p_nul, p_ext
-
-
-def _top_scores(lam_home: float, lam_away: float, n: int = 5) -> list[dict]:
-    scores = []
-    for g1 in range(7):
-        for g2 in range(7):
-            prob = _poisson_prob(lam_home, g1) * _poisson_prob(lam_away, g2) * 100
-            scores.append({"score": f"{g1}-{g2}", "probabilité_%": round(prob, 2)})
-    scores.sort(key=lambda x: x["probabilité_%"], reverse=True)
-    return scores[:n]
-
-
-# ─────────────────────────────────────────────
-#  VALUE BETTING : DEVIG + EDGE + EV + KELLY
-# ─────────────────────────────────────────────
-
-def _devig(cote_dom: float, cote_nul: float, cote_ext: float) -> dict:
-    """
-    Retire la marge bookmaker (méthode multiplicative).
-    La somme des probas retournées est exactement 1.0.
-    """
-    total = 1.0 / cote_dom + 1.0 / cote_nul + 1.0 / cote_ext
+def _team_stats(block: dict) -> dict:
+    """Extrait les stats saison (splits dom/ext) + forme récente de /predictions."""
+    last5 = block.get("last_5") or {}
+    lg    = block.get("league") or {}
+    fx    = (lg.get("fixtures") or {}).get("played") or {}
+    gf    = ((lg.get("goals") or {}).get("for") or {}).get("average") or {}
+    ga    = ((lg.get("goals") or {}).get("against") or {}).get("average") or {}
+    l5g   = last5.get("goals") or {}
     return {
-        "p_dom":   (1.0 / cote_dom) / total,
-        "p_nul":   (1.0 / cote_nul) / total,
-        "p_ext":   (1.0 / cote_ext) / total,
-        "marge_%": round((total - 1.0) * 100, 2),
+        "n_home":  int(fx.get("home") or 0),
+        "n_away":  int(fx.get("away") or 0),
+        "n_total": int(fx.get("total") or 0),
+        "gf_home": _f(gf.get("home")), "gf_away": _f(gf.get("away")), "gf_total": _f(gf.get("total")),
+        "ga_home": _f(ga.get("home")), "ga_away": _f(ga.get("away")), "ga_total": _f(ga.get("total")),
+        "l5_played": int(last5.get("played") or 0),
+        "l5_gf":     _f((l5g.get("for") or {}).get("average")),
+        "l5_ga":     _f((l5g.get("against") or {}).get("average")),
+        "l5_forme":  last5.get("form"),
     }
 
 
-def _compute_value_bets(
-    p_dom: float, p_nul: float, p_ext: float,
-    cote_dom: float, cote_nul: float, cote_ext: float,
-) -> list[dict]:
+def _expected_goals(home: dict, away: dict, league_id: int, is_neutral: bool) -> tuple[float, float, dict]:
     """
-    Identifie les paris à valeur positive.
-    Un pari est retenu seulement si :
-      edge  = p_modèle − p_marché_juste  > EDGE_THRESHOLD (3 %)
-      EV    = p_modèle × cote − 1        > EV_THRESHOLD   (4 %)
-    La mise est le quart de Kelly pour limiter la variance.
+    Buts attendus (λ) via forces relatives sur les stats SAISON.
+
+    Match classique : split domicile/extérieur — l'avantage du terrain est
+    porté UNE SEULE fois, par les moyennes de ligue avg_h/avg_a et les splits.
+      att_dom = buts marqués à domicile / moyenne dom de la ligue
+      def_dom = buts encaissés à domicile / moyenne ext de la ligue
+      λ_dom   = att_dom × def_ext × avg_h   (pas de prime ×1.10 en plus)
+
+    Terrain neutre (WC) : stats totales, base commune = moyenne globale.
+    Puis ajustement de forme récente (5 derniers matchs, ±15 %).
     """
-    fair = _devig(cote_dom, cote_nul, cote_ext)
-    bets = []
-    for label, p_model, cote, p_fair in [
-        ("1 (domicile)", p_dom, cote_dom, fair["p_dom"]),
-        ("X (nul)",      p_nul, cote_nul, fair["p_nul"]),
-        ("2 (extérieur)", p_ext, cote_ext, fair["p_ext"]),
-    ]:
-        if not cote or cote <= 1.0:
+    avg_h, avg_a = LEAGUE_GOALS.get(league_id, (1.40, 1.15))
+    overall      = (avg_h + avg_a) / 2.0
+
+    if is_neutral:
+        att_h = _shrink(home["gf_total"] / overall, home["n_total"])
+        def_h = _shrink(home["ga_total"] / overall, home["n_total"])
+        att_a = _shrink(away["gf_total"] / overall, away["n_total"])
+        def_a = _shrink(away["ga_total"] / overall, away["n_total"])
+        lam_h = att_h * def_a * overall
+        lam_a = att_a * def_h * overall
+    else:
+        att_h = _shrink(home["gf_home"] / avg_h, home["n_home"])
+        def_h = _shrink(home["ga_home"] / avg_a, home["n_home"])
+        att_a = _shrink(away["gf_away"] / avg_a, away["n_away"])
+        def_a = _shrink(away["ga_away"] / avg_h, away["n_away"])
+        lam_h = att_h * def_a * avg_h
+        lam_a = att_a * def_h * avg_a
+
+    f_h = _form_factor(home["l5_played"], home["l5_gf"], home["gf_total"])
+    f_a = _form_factor(away["l5_played"], away["l5_gf"], away["gf_total"])
+    lam_h = max(0.2, min(4.5, lam_h * f_h))
+    lam_a = max(0.2, min(4.5, lam_a * f_a))
+
+    details = {
+        "force_attaque_dom": round(att_h, 2), "force_défense_dom": round(def_h, 2),
+        "force_attaque_ext": round(att_a, 2), "force_défense_ext": round(def_a, 2),
+        "facteur_forme_dom": round(f_h, 3),   "facteur_forme_ext": round(f_a, 3),
+    }
+    return round(lam_h, 3), round(lam_a, 3), details
+
+
+def _score_matrix(lam_h: float, lam_a: float, size: int = 12) -> list[list[float]]:
+    """
+    Matrice des scores Poisson avec correction Dixon-Coles :
+    le Poisson indépendant sous-estime les nuls (0-0, 1-1) — ρ négatif
+    les regonfle et dégonfle 1-0/0-1, puis on renormalise à 1.
+    """
+    m = [[_poisson_prob(lam_h, i) * _poisson_prob(lam_a, j) for j in range(size)]
+         for i in range(size)]
+    m[0][0] *= 1.0 - lam_h * lam_a * RHO
+    m[0][1] *= 1.0 + lam_h * RHO
+    m[1][0] *= 1.0 + lam_a * RHO
+    m[1][1] *= 1.0 - RHO
+    total = sum(sum(row) for row in m)
+    return [[v / total for v in row] for row in m]
+
+
+def _matrix_markets(m: list[list[float]]) -> dict:
+    """Dérive tous les marchés de la matrice des scores."""
+    size = len(m)
+    p1 = px = p2 = over25 = btts = 0.0
+    for i in range(size):
+        for j in range(size):
+            p = m[i][j]
+            if   i > j:  p1 += p
+            elif i == j: px += p
+            else:        p2 += p
+            if i + j >= 3:          over25 += p
+            if i >= 1 and j >= 1:   btts   += p
+    top = sorted(
+        ({"score": f"{i}-{j}", "probabilité_%": round(m[i][j] * 100, 2)}
+         for i in range(7) for j in range(7)),
+        key=lambda x: x["probabilité_%"], reverse=True,
+    )[:5]
+    return {"p1": p1, "px": px, "p2": p2, "over25": over25, "btts": btts, "top_scores": top}
+
+
+# ─────────────────────────────────────────────
+#  MON PETIT PRONO
+# ─────────────────────────────────────────────
+
+def _mon_petit_prono(m: list[list[float]], p1: float, px: float, p2: float) -> dict:
+    """
+    Score à jouer sur Mon Petit Prono : maximise les points attendus.
+    E(score) = P(bon résultat) × PTS_RESULT + P(score exact) × (PTS_EXACT − PTS_RESULT)
+    (le score exact rapporte PTS_EXACT au total, résultat inclus).
+    Le résultat le plus probable ne donne pas toujours le meilleur score :
+    on balaye toute la grille 0-5.
+    """
+    cands = []
+    for i in range(6):
+        for j in range(6):
+            p_res = p1 if i > j else (px if i == j else p2)
+            e = p_res * MPP_PTS_RESULT + m[i][j] * (MPP_PTS_EXACT - MPP_PTS_RESULT)
+            cands.append((e, i, j))
+    cands.sort(key=lambda x: x[0], reverse=True)
+    best = cands[0]
+    return {
+        "score_conseillé":  f"{best[1]}-{best[2]}",
+        "points_attendus":  round(best[0], 2),
+        "alternatives": [
+            {"score": f"{e[1]}-{e[2]}", "points_attendus": round(e[0], 2)}
+            for e in cands[1:3]
+        ],
+    }
+
+
+# ─────────────────────────────────────────────
+#  MARCHÉ : PARSING DES COTES + DEVIG "POWER"
+# ─────────────────────────────────────────────
+
+def _parse_odds(odds_response: list) -> tuple[dict, dict, str]:
+    """
+    Retourne :
+      best : marché → sélection → {"cote": meilleure cote, "book": nom}
+      ref  : marché → sélection → cote du bookmaker de référence (devig)
+      nom du bookmaker de référence
+    """
+    best: dict = {}
+    ref:  dict = {}
+    bookmakers = odds_response[0].get("bookmakers", []) if odds_response else []
+    ref_bk = None
+    for pid in PREFERRED_BOOKMAKER_IDS:
+        ref_bk = next((b for b in bookmakers if b.get("id") == pid), None)
+        if ref_bk:
+            break
+    if ref_bk is None and bookmakers:
+        ref_bk = bookmakers[0]
+
+    for bk in bookmakers:
+        for bet in bk.get("bets", []):
+            if bet.get("name") not in MARKETS_MAP:
+                continue
+            mlabel, selmap = MARKETS_MAP[bet["name"]]
+            for v in bet.get("values", []):
+                if v.get("value") not in selmap:
+                    continue
+                sel = selmap[v["value"]]
+                odd = _f(v.get("odd"))
+                if odd <= 1.0:
+                    continue
+                cur = best.setdefault(mlabel, {}).get(sel)
+                if cur is None or odd > cur["cote"]:
+                    best[mlabel][sel] = {"cote": odd, "book": bk.get("name", "?")}
+                if bk is ref_bk:
+                    ref.setdefault(mlabel, {})[sel] = odd
+    return best, ref, (ref_bk.get("name", "?") if ref_bk else "")
+
+
+def _devig_power(odds: list[float]) -> tuple[list[float], float]:
+    """
+    Retire la marge bookmaker par la méthode "power" : p_i = (1/o_i)^k,
+    k résolu pour que Σp = 1. Moins biaisée que la méthode multiplicative
+    sur les outsiders (biais favori-outsider). Retourne (probas, marge).
+    """
+    imps   = [1.0 / o for o in odds]
+    margin = sum(imps) - 1.0
+    lo, hi = 0.5, 5.0
+    for _ in range(60):
+        k = (lo + hi) / 2.0
+        if sum(ip ** k for ip in imps) > 1.0:
+            lo = k
+        else:
+            hi = k
+    probs = [ip ** ((lo + hi) / 2.0) for ip in imps]
+    total = sum(probs)
+    return [p / total for p in probs], round(margin * 100, 2)
+
+
+# ─────────────────────────────────────────────
+#  VALUE BETTING : BLEND + EDGE + EV + KELLY
+# ─────────────────────────────────────────────
+
+def _market_value_bets(
+    market: str,
+    model_probs: dict[str, float],
+    ref_odds: dict[str, float],
+    best_odds: dict[str, dict],
+    threshold_mult: float,
+    labels: dict[str, str],
+) -> tuple[list[dict], dict, list[str]]:
+    """
+    Pour un marché donné :
+      1. Devig power des cotes du bookmaker de référence → probas "justes"
+      2. Blend : p_finale = 65 % marché + 35 % modèle
+         (edge = 0.35 × désaccord modèle-marché → il faut un vrai désaccord)
+      3. Pick si edge ≥ seuil ET EV ≥ seuil (EV sur la MEILLEURE cote)
+      4. Un seul pick max par marché (le meilleur EV) — deux issues
+         gagnantes du même marché = modèle mal calibré, pas double chance.
+    Retourne (picks, infos marché, warnings).
+    """
+    sels = MARKET_SELECTIONS[market]
+    warnings: list[str] = []
+    if not all(s in ref_odds for s in sels):
+        return [], {}, warnings
+
+    fair_list, margin = _devig_power([ref_odds[s] for s in sels])
+    fair    = dict(zip(sels, fair_list))
+    blended = {s: MARKET_WEIGHT * fair[s] + (1.0 - MARKET_WEIGHT) * model_probs[s] for s in sels}
+
+    candidates = []
+    for s in sels:
+        info = best_odds.get(s)
+        if not info or info["cote"] <= 1.0:
             continue
-        edge  = p_model - p_fair
-        ev    = p_model * cote - 1.0
-        kelly = max(0.0, ev / (cote - 1.0)) * KELLY_FRACTION
-        if edge >= EDGE_THRESHOLD and ev >= EV_THRESHOLD:
-            bets.append({
-                "issue":            label,
-                "p_modèle_%":       round(p_model * 100, 1),
-                "p_marché_juste_%": round(p_fair  * 100, 1),
-                "edge_%":           round(edge    * 100, 1),
-                "EV_%":             round(ev      * 100, 1),
-                "cote":             cote,
-                "mise_kelly_%":     round(kelly   * 100, 1),
+        cote  = info["cote"]
+        edge  = blended[s] - fair[s]
+        ev    = blended[s] * cote - 1.0
+        if edge >= EDGE_THRESHOLD * threshold_mult and ev >= EV_THRESHOLD * threshold_mult:
+            kelly = min(max(0.0, ev / (cote - 1.0)) * KELLY_FRACTION, MAX_STAKE_PER_BET)
+            candidates.append({
+                "marché":       market,
+                "pari":         s,
+                "libellé":      labels[s],
+                "cote":         cote,
+                "bookmaker":    info["book"],
+                "p_modèle_%":   round(model_probs[s] * 100, 1),
+                "p_marché_%":   round(fair[s] * 100, 1),
+                "p_finale_%":   round(blended[s] * 100, 1),
+                "edge_%":       round(edge * 100, 1),
+                "EV_%":         round(ev * 100, 1),
+                "mise_kelly_%": round(kelly * 100, 2),
             })
-    return sorted(bets, key=lambda x: x["EV_%"], reverse=True)
+
+    candidates.sort(key=lambda x: x["EV_%"], reverse=True)
+    if len(candidates) > 1:
+        warnings.append(
+            f"Anomalie {market} : plusieurs issues du même marché passaient les seuils "
+            f"— seul le meilleur EV est conservé (signe de calibration à surveiller)."
+        )
+    market_info = {
+        "marge_%":  margin,
+        "p_marché": {s: round(fair[s] * 100, 1) for s in sels},
+        "p_finale": {s: round(blended[s] * 100, 1) for s in sels},
+    }
+    return candidates[:1], market_info, warnings
+
+
+def _apply_exposure_cap(picks: list[dict], warnings: list[str]) -> list[dict]:
+    """Plafonne l'exposition cumulée de la journée à DAILY_EXPOSURE_CAP."""
+    global _RUN_EXPOSURE
+    kept = []
+    for pick in sorted(picks, key=lambda x: x["EV_%"], reverse=True):
+        stake     = pick["mise_kelly_%"] / 100.0
+        remaining = DAILY_EXPOSURE_CAP - _RUN_EXPOSURE
+        if remaining < 0.0025:
+            warnings.append(
+                f"Plafond journalier de {DAILY_EXPOSURE_CAP:.0%} atteint — "
+                f"pari {pick['libellé']} écarté malgré un EV de {pick['EV_%']}%."
+            )
+            continue
+        if stake > remaining:
+            stake = remaining
+            pick["mise_kelly_%"] = round(stake * 100, 2)
+            warnings.append(f"Mise réduite ({pick['libellé']}) pour respecter le plafond journalier.")
+        _RUN_EXPOSURE += stake
+        kept.append(pick)
+    return kept
 
 
 # ─────────────────────────────────────────────
-#  SUIVI DES PERFORMANCES
+#  SUIVI DES PERFORMANCES (CSV + SETTLEMENT)
 # ─────────────────────────────────────────────
+
+def _ensure_csv_schema() -> None:
+    """Si un ancien CSV avec un autre schéma existe, on l'archive."""
+    if not PERF_FILE.exists():
+        return
+    with open(PERF_FILE, encoding="utf-8", newline="") as f:
+        header = f.readline().strip()
+    if header != ",".join(PERF_FIELDS):
+        legacy = PERF_FILE.with_name("bet_history_legacy.csv")
+        PERF_FILE.rename(legacy)
+        logging.info(f"[Perf] Ancien schéma CSV archivé → {legacy.name}")
+
 
 def _log_bets_to_csv(date_str: str, match_label: str, fixture_id: int, bets: list[dict]) -> None:
     """
     Enregistre chaque value bet dans bet_history.csv.
-    Remplis la colonne "résultat" après le match pour calculer ROI et yield.
-    CLV (Closing Line Value) peut être ajoutée en comparant cote_prise vs cote_clôture.
+    résultat/gain_unités sont remplis automatiquement par settle_pending_bets().
+    clv reste manuelle (cotes de clôture non fiables sur le plan Free).
     """
     if not bets:
         return
-    fieldnames = ["date", "fixture_id", "match", "issue", "cote", "ev_%", "kelly_%", "résultat", "clv"]
+    _ensure_csv_schema()
     needs_header = not PERF_FILE.exists()
     with open(PERF_FILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=PERF_FIELDS)
         if needs_header:
             w.writeheader()
         for bet in bets:
@@ -275,14 +550,116 @@ def _log_bets_to_csv(date_str: str, match_label: str, fixture_id: int, bets: lis
                 "date":       date_str,
                 "fixture_id": fixture_id,
                 "match":      match_label,
-                "issue":      bet["issue"],
+                "marché":     bet["marché"],
+                "pari":       bet["pari"],
                 "cote":       bet["cote"],
+                "bookmaker":  bet["bookmaker"],
+                "p_modèle_%": bet["p_modèle_%"],
+                "p_marché_%": bet["p_marché_%"],
+                "p_finale_%": bet["p_finale_%"],
+                "edge_%":     bet["edge_%"],
                 "ev_%":       bet["EV_%"],
-                "kelly_%":    bet["mise_kelly_%"],
+                "mise_%":     bet["mise_kelly_%"],
                 "résultat":   "",
+                "gain_unités": "",
                 "clv":        "",
             })
     logging.info(f"[Perf] {len(bets)} value bet(s) loggé(s) dans bet_history.csv")
+
+
+def _bet_won(marche: str, pari: str, gh: int, ga: int) -> bool:
+    if marche == "1X2":
+        actual = "1" if gh > ga else ("2" if ga > gh else "X")
+        return pari == actual
+    if marche == "O/U 2.5":
+        return (pari == "Over") == (gh + ga >= 3)
+    if marche == "BTTS":
+        return (pari == "Oui") == (gh >= 1 and ga >= 1)
+    return False
+
+
+def settle_pending_bets() -> str:
+    """
+    Règle les paris en attente : récupère les scores (90 min) des fixtures
+    terminées, remplit résultat + gain, et retourne un bilan texte
+    (jour réglé + cumul : ROI, yield, taux de réussite, Brier).
+    """
+    _ensure_csv_schema()
+    if not PERF_FILE.exists():
+        return ""
+
+    with open(PERF_FILE, encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return ""
+
+    pending_ids = sorted({r["fixture_id"] for r in rows if not r["résultat"]})
+    results: dict[str, tuple] = {}
+    # L'endpoint /fixtures accepte jusqu'à 20 ids par requête ("id-id-id")
+    for i in range(0, len(pending_ids), 20):
+        batch = pending_ids[i:i + 20]
+        try:
+            for m in _api_get("fixtures", {"ids": "-".join(batch)}):
+                status = m["fixture"]["status"]["short"]
+                ft     = (m.get("score") or {}).get("fulltime") or {}
+                gh, ga = ft.get("home"), ft.get("away")
+                if gh is None or ga is None:
+                    gh, ga = m["goals"]["home"], m["goals"]["away"]
+                results[str(m["fixture"]["id"])] = (status, gh, ga)
+        except Exception as e:
+            logging.warning(f"[Perf] Settlement impossible pour le lot {batch}: {e}")
+
+    settled_now = 0
+    profit_now  = 0.0
+    for r in rows:
+        if r["résultat"]:
+            continue
+        res = results.get(r["fixture_id"])
+        if not res:
+            continue
+        status, gh, ga = res
+        if status in ("CANC", "ABD"):
+            r["résultat"], r["gain_unités"] = "annulé", "0.0"
+            continue
+        if status not in ("FT", "AET", "PEN") or gh is None or ga is None:
+            continue  # pas encore joué / reporté → reste en attente
+        # Marchés pré-match réglés sur le temps réglementaire (score fulltime)
+        mise = _f(r["mise_%"])
+        if _bet_won(r["marché"], r["pari"], int(gh), int(ga)):
+            r["résultat"]    = "gagné"
+            r["gain_unités"] = str(round(mise * (_f(r["cote"]) - 1.0), 3))
+        else:
+            r["résultat"]    = "perdu"
+            r["gain_unités"] = str(round(-mise, 3))
+        settled_now += 1
+        profit_now  += _f(r["gain_unités"])
+
+    with open(PERF_FILE, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=PERF_FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+
+    # ── Bilan cumulé ──────────────────────────────────────────────
+    settled = [r for r in rows if r["résultat"] in ("gagné", "perdu")]
+    if not settled:
+        return ""
+    n       = len(settled)
+    wins    = sum(1 for r in settled if r["résultat"] == "gagné")
+    staked  = sum(_f(r["mise_%"]) for r in settled)
+    profit  = sum(_f(r["gain_unités"]) for r in settled)
+    yield_  = (profit / staked * 100) if staked else 0.0
+    brier   = sum(
+        (_f(r["p_finale_%"]) / 100 - (1.0 if r["résultat"] == "gagné" else 0.0)) ** 2
+        for r in settled
+    ) / n
+    lines = [
+        f"Paris réglés (cumul) : {n} — {wins} gagnés ({wins / n * 100:.0f}%)",
+        f"Total misé : {staked:.1f}% de bankroll · Profit net : {profit:+.2f} points de bankroll",
+        f"Yield : {yield_:+.1f}% · Brier (calibration, plus bas = mieux) : {brier:.3f}",
+    ]
+    if settled_now:
+        lines.insert(0, f"Nouveaux paris réglés ce matin : {settled_now} → {profit_now:+.2f} points de bankroll")
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────
@@ -290,29 +667,57 @@ def _log_bets_to_csv(date_str: str, match_label: str, fixture_id: int, bets: lis
 # ─────────────────────────────────────────────
 
 def get_fixtures_today() -> str:
-    today   = date.today().isoformat()
-    all_fix = _api_get("fixtures", {"date": today})
-    result: list[dict] = []
+    """
+    Matchs du jour (heure de Paris) avec sélection DÉTERMINISTE en Python :
+    tous les matchs de Coupe du Monde, puis max 3/ligue et 15 au total
+    (budget API : 2 requêtes par match analysé).
+    """
+    today = _now_fr().date().isoformat()
+    # timezone=Europe/Paris : sinon l'API filtre sur le jour UTC et les
+    # matchs de fin de soirée basculent sur la mauvaise date.
+    all_fix = _api_get("fixtures", {"date": today, "timezone": "Europe/Paris"})
+
+    candidates: list[dict] = []
     for m in all_fix:
         lid = m["league"]["id"]
         if lid not in TARGET_LEAGUES:
             continue
-        ts = m["fixture"]["timestamp"]
-        result.append({
+        if m["fixture"]["status"]["short"] not in ("NS", "TBD"):
+            continue  # déjà joué / en cours → inutile de pronostiquer
+        candidates.append({
             "fixture_id":       m["fixture"]["id"],
             "tournament":       TARGET_LEAGUES[lid],
             "league_id":        lid,
             "is_neutral_venue": lid in NEUTRAL_LEAGUES,
-            "heure_fr":         _ts_to_fr(ts) if ts else "?",
+            "heure_fr":         m["fixture"]["date"][11:16],
             "home_team":        m["teams"]["home"]["name"],
             "home_id":          m["teams"]["home"]["id"],
             "away_team":        m["teams"]["away"]["name"],
             "away_id":          m["teams"]["away"]["id"],
-            "statut":           m["fixture"]["status"]["long"],
         })
-    if not result:
+
+    # Sélection : WC d'abord (tous), puis ligues dans l'ordre de TARGET_LEAGUES
+    selected: list[dict] = [c for c in candidates if c["league_id"] in NEUTRAL_LEAGUES]
+    per_league: dict[int, int] = {}
+    for lid in TARGET_LEAGUES:
+        if lid in NEUTRAL_LEAGUES:
+            continue
+        for c in candidates:
+            if len(selected) >= MAX_MATCHES_PER_DAY:
+                break
+            if c["league_id"] == lid and per_league.get(lid, 0) < MAX_MATCHES_PER_LEAGUE:
+                selected.append(c)
+                per_league[lid] = per_league.get(lid, 0) + 1
+    selected = selected[:MAX_MATCHES_PER_DAY]
+    selected.sort(key=lambda c: c["heure_fr"])
+
+    if not selected:
         return "Aucun match trouvé aujourd'hui pour les ligues sélectionnées."
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return json.dumps({
+        "nb_matchs_sélectionnés": len(selected),
+        "consigne": "Analyse TOUS ces matchs (la sélection est déjà faite).",
+        "matchs": selected,
+    }, ensure_ascii=False, indent=2)
 
 
 def get_match_analysis(
@@ -324,53 +729,67 @@ def get_match_analysis(
 ) -> str:
     """
     Analyse complète orientée value betting :
-    1. Forme (5 derniers matchs) via /predictions
-    2. H2H — 3 matchs récents seulement (indicateur faible, pondéré en conséquence)
-    3. Poisson forces relatives + shrinkage → λ_dom, λ_ext
-    4. Probas 1X2 du modèle vs probas implicites déviggées
-    5. Value bets (edge > 3%, EV > 4%) avec mise Kelly/4
-    6. Avertissements QA si données insuffisantes
+    1. Stats saison (splits dom/ext) + forme récente via /predictions
+    2. Poisson forces relatives + shrinkage + Dixon-Coles → matrice des scores
+    3. Marchés 1X2, O/U 2.5, BTTS : devig power (book de référence),
+       blend 65 % marché / 35 % modèle, picks si edge/EV suffisants
+    4. Mise Kelly/4 plafonnée (2 %/pari, 8 %/jour)
+    5. Score conseillé Mon Petit Prono
+    6. Avertissements QA
     """
-    time.sleep(0.3)
+    threshold_mult = WC_THRESHOLD_MULT if is_neutral_venue else 1.0
+    warnings: list[str] = []
 
-    # ── 1. Prédictions API (forme + H2H) ──────────────────────────
-    preds    = _api_get("predictions", {"fixture": fixture_id})
-    forme    = {}
-    h2h_list = []
-    lam_h = lam_a = 0.0
-    poisson_data: dict = {}
-    p_dom = p_nul = p_ext = None
-    h_played = a_played = 0
+    # ── 1. Prédictions API (stats saison + forme + H2H) ───────────
+    preds = _api_get("predictions", {"fixture": fixture_id})
+    forme: dict = {}
+    h2h_list: list = []
+    model_block: dict = {}
+    mpp: dict = {}
+    matrix = None
+    mk: dict = {}
+    home_s = away_s = None
 
     if preds:
-        p       = preds[0]
-        teams   = p.get("teams", {})
-        h_last5 = teams.get("home", {}).get("last_5", {})
-        a_last5 = teams.get("away", {}).get("last_5", {})
-
-        h_avg_for = float(h_last5.get("goals", {}).get("for",     {}).get("average", 0) or 0)
-        h_avg_ag  = float(h_last5.get("goals", {}).get("against", {}).get("average", 0) or 0)
-        a_avg_for = float(a_last5.get("goals", {}).get("for",     {}).get("average", 0) or 0)
-        a_avg_ag  = float(a_last5.get("goals", {}).get("against", {}).get("average", 0) or 0)
-        h_played  = int(h_last5.get("played") or 0)
-        a_played  = int(a_last5.get("played") or 0)
+        p      = preds[0]
+        teams  = p.get("teams", {})
+        home_s = _team_stats(teams.get("home") or {})
+        away_s = _team_stats(teams.get("away") or {})
 
         forme = {
             "domicile": {
-                "matchs_joués":       h_played,
-                "buts_marqués_moy":   h_avg_for,
-                "buts_encaissés_moy": h_avg_ag,
+                "saison": {
+                    "matchs":                home_s["n_total"],
+                    "buts_marqués_dom":      home_s["gf_home"],
+                    "buts_encaissés_dom":    home_s["ga_home"],
+                    "buts_marqués_total":    home_s["gf_total"],
+                    "buts_encaissés_total":  home_s["ga_total"],
+                },
+                "5_derniers": {
+                    "matchs":          home_s["l5_played"],
+                    "buts_marqués":    home_s["l5_gf"],
+                    "buts_encaissés":  home_s["l5_ga"],
+                    "forme_%":         home_s["l5_forme"],
+                },
             },
             "extérieur": {
-                "matchs_joués":       a_played,
-                "buts_marqués_moy":   a_avg_for,
-                "buts_encaissés_moy": a_avg_ag,
+                "saison": {
+                    "matchs":                away_s["n_total"],
+                    "buts_marqués_ext":      away_s["gf_away"],
+                    "buts_encaissés_ext":    away_s["ga_away"],
+                    "buts_marqués_total":    away_s["gf_total"],
+                    "buts_encaissés_total":  away_s["ga_total"],
+                },
+                "5_derniers": {
+                    "matchs":          away_s["l5_played"],
+                    "buts_marqués":    away_s["l5_gf"],
+                    "buts_encaissés":  away_s["l5_ga"],
+                    "forme_%":         away_s["l5_forme"],
+                },
             },
         }
 
-        # H2H : 3 derniers matchs seulement
-        # Note : indicateur à faible valeur prédictive (effectifs changent, matchs anciens)
-        # Ne pas utiliser comme argument principal du pick
+        # H2H : 3 derniers matchs — indicateur faible, jamais un argument principal
         h2h_list = [
             {
                 "date":  m["fixture"]["date"][:10],
@@ -383,85 +802,138 @@ def get_match_analysis(
             for m in p.get("h2h", [])[:3]
         ]
 
-        # Poisson avec forces relatives + shrinkage
-        lam_h, lam_a = _relative_poisson(
-            h_avg_for, h_avg_ag, a_avg_for, a_avg_ag,
-            h_played, a_played, league_id, is_neutral_venue,
-        )
-        p_dom, p_nul, p_ext = _poisson_1x2(lam_h, lam_a)
+        lam_h, lam_a, strengths = _expected_goals(home_s, away_s, league_id, is_neutral_venue)
+        matrix = _score_matrix(lam_h, lam_a)
+        mk     = _matrix_markets(matrix)
 
-        poisson_data = {
+        model_block = {
             "λ_dom":               lam_h,
             "λ_ext":               lam_a,
             "buts_attendus_total": round(lam_h + lam_a, 2),
-            "p_victoire_dom_%":    round(p_dom * 100, 1),
-            "p_nul_%":             round(p_nul * 100, 1),
-            "p_victoire_ext_%":    round(p_ext * 100, 1),
-            "top_scores":          _top_scores(lam_h, lam_a),
+            "p_victoire_dom_%":    round(mk["p1"] * 100, 1),
+            "p_nul_%":             round(mk["px"] * 100, 1),
+            "p_victoire_ext_%":    round(mk["p2"] * 100, 1),
+            "p_over_2.5_%":        round(mk["over25"] * 100, 1),
+            "p_BTTS_%":            round(mk["btts"] * 100, 1),
+            "top_scores":          mk["top_scores"],
+            "forces":              strengths,
         }
+    else:
+        warnings.append("Prédictions API indisponibles — aucune analyse modèle possible.")
 
-    # ── 2. Cotes bookmaker (1X2) ──────────────────────────────────
-    cote_dom = cote_nul = cote_ext = None
+    # ── 2. Cotes (tous bookmakers) ────────────────────────────────
+    best_odds: dict = {}
+    ref_odds:  dict = {}
+    ref_name = ""
     try:
         odds_list = _api_get("odds", {"fixture": fixture_id})
-        if odds_list:
-            for bk in odds_list[0].get("bookmakers", [])[:1]:
-                for bet in bk.get("bets", []):
-                    if bet["name"] == "Match Winner":
-                        for v in bet.get("values", []):
-                            if   v["value"] == "Home": cote_dom = float(v["odd"])
-                            elif v["value"] == "Draw": cote_nul = float(v["odd"])
-                            elif v["value"] == "Away": cote_ext = float(v["odd"])
+        best_odds, ref_odds, ref_name = _parse_odds(odds_list)
     except Exception as e:
         logging.warning(f"Erreur cotes fixture {fixture_id}: {e}")
 
-    # ── 3. Value betting ──────────────────────────────────────────
-    value_bets   = []
-    marche_devig = {}
-    if all(x is not None for x in [cote_dom, cote_nul, cote_ext, p_dom]):
-        fair = _devig(cote_dom, cote_nul, cote_ext)
-        marche_devig = {
-            "p_dom_%":  round(fair["p_dom"] * 100, 1),
-            "p_nul_%":  round(fair["p_nul"] * 100, 1),
-            "p_ext_%":  round(fair["p_ext"] * 100, 1),
-            "marge_%":  fair["marge_%"],
-        }
-        value_bets = _compute_value_bets(p_dom, p_nul, p_ext, cote_dom, cote_nul, cote_ext)
-
-    # ── 4. QA ─────────────────────────────────────────────────────
-    warnings: list[str] = []
-    if h_played < 3 or a_played < 3:
-        warnings.append(
-            f"Petit échantillon ({h_played}/{a_played} matchs) — estimation Poisson fragile, "
-            "shrinkage augmenté vers la moyenne de ligue."
-        )
-    if cote_dom is None:
+    # ── 3. Value betting multi-marchés ────────────────────────────
+    value_bets: list[dict] = []
+    market_info: dict = {}
+    if mk and ref_odds:
+        home_lbl = home_team or "domicile"
+        away_lbl = away_team or "extérieur"
+        market_defs = [
+            ("1X2",
+             {"1": mk["p1"], "X": mk["px"], "2": mk["p2"]},
+             {"1": f"Victoire {home_lbl}", "X": "Match nul", "2": f"Victoire {away_lbl}"}),
+            ("O/U 2.5",
+             {"Over": mk["over25"], "Under": 1.0 - mk["over25"]},
+             {"Over": "Plus de 2,5 buts", "Under": "Moins de 2,5 buts"}),
+            ("BTTS",
+             {"Oui": mk["btts"], "Non": 1.0 - mk["btts"]},
+             {"Oui": "Les deux équipes marquent", "Non": "Au moins une équipe ne marque pas"}),
+        ]
+        for market, probs, labels in market_defs:
+            picks, info, w = _market_value_bets(
+                market, probs, ref_odds.get(market, {}), best_odds.get(market, {}),
+                threshold_mult, labels,
+            )
+            value_bets.extend(picks)
+            warnings.extend(w)
+            if info:
+                market_info[market] = info
+        value_bets = _apply_exposure_cap(value_bets, warnings)
+        value_bets.sort(key=lambda x: x["EV_%"], reverse=True)
+    elif mk and not ref_odds:
         warnings.append("Cotes non disponibles — calcul EV impossible, aucun value bet.")
+
+    # ── 4. Mon Petit Prono ────────────────────────────────────────
+    if matrix is not None:
+        blend_1x2 = (market_info.get("1X2") or {}).get("p_finale")
+        if blend_1x2:
+            p1b, pxb, p2b = blend_1x2["1"] / 100, blend_1x2["X"] / 100, blend_1x2["2"] / 100
+        else:
+            p1b, pxb, p2b = mk["p1"], mk["px"], mk["p2"]
+        mpp = _mon_petit_prono(matrix, p1b, pxb, p2b)
+
+    # ── 5. QA ─────────────────────────────────────────────────────
+    if home_s and (home_s["n_total"] < 5 or away_s["n_total"] < 5):
+        warnings.append(
+            f"Petit échantillon saison ({home_s['n_total']}/{away_s['n_total']} matchs) "
+            "— estimation fortement régularisée vers la moyenne de ligue."
+        )
+    if is_neutral_venue:
+        warnings.append(
+            "Match international : les stats mélangent des adversaires de niveaux très "
+            "différents — seuils de value doublés, confiance réduite."
+        )
 
     # Log automatique pour suivi performances
     match_label = f"{home_team} vs {away_team}" if home_team else str(fixture_id)
-    _log_bets_to_csv(date.today().isoformat(), match_label, fixture_id, value_bets)
+    _log_bets_to_csv(_now_fr().date().isoformat(), match_label, fixture_id, value_bets)
 
     return json.dumps({
-        "forme":          forme,
-        "h2h":            h2h_list,
-        "poisson":        poisson_data,
-        "cotes_brutes":   {"dom": cote_dom, "nul": cote_nul, "ext": cote_ext},
-        "marché_dévig":   marche_devig,
-        "value_bets":     value_bets,
-        "avertissements": warnings,
+        "forme":                forme,
+        "h2h":                  h2h_list,
+        "modèle":               model_block,
+        "bookmaker_référence":  ref_name,
+        "marchés":              market_info,
+        "value_bets":           value_bets,
+        "mon_petit_prono":      mpp,
+        "avertissements":       warnings,
+        "exposition_cumulée_%": round(_RUN_EXPOSURE * 100, 2),
     }, ensure_ascii=False, indent=2)
+
+
+def _split_message(text: str, limit: int = 4000) -> list[str]:
+    """Découpe aux sauts de ligne : ne coupe jamais une balise HTML en deux."""
+    parts, current = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            parts.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) + 1 > limit:
+            parts.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        parts.append(current)
+    return parts
 
 
 def send_telegram_report(text: str) -> str:
     url    = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
+    chunks = _split_message(text)
     for chunk in chunks:
         resp = requests.post(
             url,
             json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "HTML"},
             timeout=15,
         )
+        if resp.status_code == 400:
+            # HTML invalide → fallback texte brut plutôt que perdre le rapport
+            logging.warning("Telegram a refusé le HTML — envoi en texte brut.")
+            resp = requests.post(
+                url,
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": re.sub(r"<[^>]+>", "", chunk)},
+                timeout=15,
+            )
         resp.raise_for_status()
     return f"✅ Message envoyé sur Telegram ({len(chunks)} partie(s))."
 
@@ -474,20 +946,22 @@ TOOLS = [
     {
         "name": "get_fixtures_today",
         "description": (
-            "Récupère tous les matchs du jour pour : FIFA Coupe du Monde, Premier League, "
-            "La Liga, Bundesliga, Serie A, Ligue 1. "
-            "Retourne fixture_id, league_id, home/away team + IDs, heure FR, is_neutral_venue. "
-            "Toujours appeler EN PREMIER, sans argument."
+            "Récupère les matchs du jour DÉJÀ SÉLECTIONNÉS (Coupe du Monde en entier, "
+            "puis max 3/ligue parmi Premier League, La Liga, Bundesliga, Serie A, Ligue 1). "
+            "Retourne fixture_id, league_id, équipes + IDs, heure FR, is_neutral_venue. "
+            "Toujours appeler EN PREMIER, sans argument. Analyser TOUS les matchs retournés."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "get_match_analysis",
         "description": (
-            "Analyse complète orientée value betting. "
-            "Retourne : forme, H2H (3 matchs récents, faible poids prédictif), "
-            "probabilités Poisson du modèle, marché dévig, et value_bets. "
-            "value_bets = liste des paris où modèle > marché (edge > 3%, EV > 4%). "
+            "Analyse complète orientée value betting. Retourne : forme (saison avec splits "
+            "domicile/extérieur + 5 derniers matchs), H2H (faible poids prédictif), "
+            "probabilités du modèle (1X2, Over/Under 2.5, BTTS, scores les plus probables), "
+            "marchés déviggés, probabilités finales (blend marché/modèle), value_bets, "
+            "et mon_petit_prono (score conseillé + points attendus). "
+            "value_bets = paris où l'estimation finale bat le marché (edge et EV suffisants). "
             "Si value_bets est vide → aucune valeur sur ce match, ne pas forcer de pick. "
             "Appeler avec home_team et away_team pour le suivi de performance."
         ),
@@ -568,33 +1042,36 @@ def execute_tool(name: str, tool_input: dict) -> str:
 # ─────────────────────────────────────────────
 
 def _build_system_prompt() -> str:
-    today = date.today().strftime("%d/%m/%Y")
+    today = _now_fr().strftime("%d/%m/%Y")
     return f"""Tu es un analyste sportif qui rédige des rapports de pronostics accessibles à tous.
 Date : {today}.
 
 Le moteur de décision probabiliste tourne en Python. Ton rôle : orchestrer les appels d'outils,
-puis rédiger un rapport que n'importe qui peut comprendre — même sans connaître les statistiques.
+puis rédiger un rapport précis et détaillé que n'importe qui peut comprendre — même sans
+connaître les statistiques.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 ÉTAPES OBLIGATOIRES
 ━━━━━━━━━━━━━━━━━━━━━━━━
-1. Appelle get_fixtures_today (sans argument).
+1. Appelle get_fixtures_today (sans argument). La sélection des matchs est déjà faite.
 2. Si aucun match → envoie un Telegram le signalant et arrête.
-3. Sélection :
-   - FIFA Coupe du Monde : TOUS les matchs.
-   - Autres ligues : max 3 matchs par ligue, 6 au total.
-4. Pour chaque match : appelle get_match_analysis avec fixture_id, is_neutral_venue, league_id,
-   home_team et away_team (fournis par get_fixtures_today).
-5. Génère le rapport et appelle send_telegram_report UNE SEULE FOIS.
+3. Pour CHAQUE match retourné : appelle get_match_analysis avec fixture_id, is_neutral_venue,
+   league_id, home_team et away_team.
+4. Génère le rapport et appelle send_telegram_report UNE SEULE FOIS.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 RÈGLE CENTRALE — VALUE BETTING
 ━━━━━━━━━━━━━━━━━━━━━━━━
-- Chaque analyse retourne value_bets : paris où notre modèle détecte un avantage réel sur le marché.
+- Les probabilités FINALES (celles à afficher) combinent déjà le marché (65 %) et notre
+  modèle (35 %) : quand un pari sort, c'est que le désaccord avec les bookmakers survit
+  même après cette prudence.
 - Si value_bets est vide → affiche "Aucun pari recommandé" — N'INVENTE PAS de pick.
 - N'utilise PAS le H2H comme argument principal (effectifs changent, trop peu de matchs).
-- La mise recommandée est pré-calculée (Kelly/4) — utilise-la telle quelle.
+- La mise recommandée est pré-calculée (Kelly/4, plafonnée à 2 % par pari et 8 % par jour)
+  — utilise-la telle quelle.
 - Tu expliques les données, tu ne prends pas de décision : le modèle l'a déjà fait.
+- Les paris peuvent porter sur 3 marchés : 1X2, Plus/Moins de 2,5 buts, Les deux équipes
+  marquent. Traduis toujours en français clair (jamais "Over 2.5" ou "BTTS" seuls).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 FORMAT DU RAPPORT (HTML strict, Telegram)
@@ -602,6 +1079,11 @@ FORMAT DU RAPPORT (HTML strict, Telegram)
 
 <b>⚽ PRONOSTICS DU {today}</b>
 <i>Analyse statistique indépendante des bookmakers</i>
+
+[Si un bilan de performance est fourni dans le message initial :]
+📈 <b>BILAN DU MODÈLE</b>
+[Recopie les chiffres du bilan en 2-3 lignes claires : paris réglés, taux de réussite,
+ profit/yield. Si le yield est négatif, dis-le honnêtement.]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -618,64 +1100,80 @@ Pour CHAQUE match, reproduis exactement cette structure :
 <b>🏟 [Éq. A] vs [Éq. B]</b>
 <i>[Compétition] — 🕐 [Heure]</i>
 
-📊 <b>Forme récente (5 derniers matchs) :</b>
-  • [Éq. A] : [x] buts marqués en moyenne, [x] encaissés par match
-  • [Éq. B] : [x] buts marqués en moyenne, [x] encaissés par match
+📊 <b>Forme :</b>
+  • [Éq. A] : saison à domicile [x] buts marqués / [x] encaissés par match — 5 derniers : [x] marqués, [x] encaissés
+  • [Éq. B] : saison à l'extérieur [x] buts marqués / [x] encaissés par match — 5 derniers : [x] marqués, [x] encaissés
+  [Sur terrain neutre (WC) : utilise les stats "total" saison, sans mention domicile/extérieur]
 
-🔢 <b>Probabilités selon notre modèle :</b>
+🔢 <b>Notre estimation finale :</b>
   • Victoire [Éq. A] : <b>[X]%</b>   ← bookmakers donnent [X]%
   • Match nul : <b>[X]%</b>           ← bookmakers donnent [X]%
   • Victoire [Éq. B] : <b>[X]%</b>   ← bookmakers donnent [X]%
+  ⚽ Buts attendus : [X.X] au total · Plus de 2,5 buts : [X]% · Les deux marquent : [X]%
   <i>Score le plus probable : [X-X] ([Y]% de chances)</i>
+  [Utilise p_finale des marchés pour "estimation finale" et p_marché pour "bookmakers".
+   Si les cotes manquent, utilise les probabilités du modèle et signale-le.]
 
 📝 <b>Analyse :</b>
-[OBLIGATOIRE — 3 à 5 phrases en langage naturel. Tu dois expliquer :
- 1. Quelle équipe est en meilleure forme et pourquoi, en citant les chiffres de forme (buts marqués/encaissés).
- 2. Ce que voit notre modèle : y a-t-il un écart entre nos probabilités et celles des bookmakers ?
-    Si oui, sur quelle issue, et pourquoi c'est potentiellement intéressant.
- 3. Conclusion claire : le match vaut-il la peine d'être joué, et sur quelle issue ?
+[OBLIGATOIRE — 4 à 6 phrases en langage naturel, précises et chiffrées. Tu dois expliquer :
+ 1. Quelle équipe est la plus solide sur la SAISON (avec les splits domicile/extérieur)
+    et laquelle arrive en meilleure forme récente — cite les chiffres.
+ 2. Le profil de buts attendu : match ouvert ou fermé ? (buts attendus, % over 2.5).
+ 3. Ce que voit notre modèle : y a-t-il un écart avec les bookmakers ? Sur quelle issue,
+    et pourquoi c'est potentiellement intéressant.
+ 4. Conclusion claire : le match vaut-il un pari, et sur quel marché ?
  Ton ton doit être celui d'un ami qui explique le match simplement, sans jargon technique.
- Exemples de formulations à utiliser :
- - "L'Allemagne est en grande forme offensive (3,3 buts par match) face à un Paraguay qui peine à scorer."
- - "Notre modèle donne 31% de chances au Japon, alors que les bookmakers ne lui en accordent que 19% — c'est là qu'on voit de la valeur."
- - "Les deux équipes se neutralisent offensivement, ce qui rend le résultat très incertain."
- - "Aucun écart significatif entre notre modèle et les cotes : pas d'avantage à parier ici."]
+ Exemples de formulations :
+ - "À domicile, Dortmund marque 2,4 buts par match cette saison, et sa forme récente confirme."
+ - "Notre estimation donne 31% au Japon contre 24% pour les bookmakers — c'est là qu'on voit de la valeur."
+ - "Avec 3,1 buts attendus, tout indique un match ouvert : 62% de chances de voir plus de 2,5 buts."
+ - "Aucun écart significatif avec les cotes : pas d'avantage à parier ici."]
 
 [Si value_bets non vide :]
 💰 <b>Pari recommandé :</b>
 [Pour chaque value bet :]
-  ✅ <b>[Victoire [Éq. X] / Match nul]</b> @ cote [X.XX]
-  Notre modèle : [X]% · Bookmakers (réel) : [X]% · Avantage : +[X] points
-  Mise conseillée : [X]% de ta bankroll habituelle
+  ✅ <b>[libellé du pari]</b> @ cote [X.XX] (chez [bookmaker])
+  Notre estimation : [p_finale]% · Bookmakers : [p_marché]% · Avantage : +[edge] points
+  Mise conseillée : [mise_kelly_%]% de ta bankroll
 
 [Si value_bets vide :]
 🚫 <b>Aucun pari recommandé sur ce match</b>
-<i>Les probabilités de notre modèle sont trop proches des cotes du marché pour justifier un risque.</i>
+<i>Notre estimation est trop proche des cotes du marché pour justifier un risque.</i>
+
+🎯 <b>Mon Petit Prono :</b> [score_conseillé] <i>([points_attendus] pts attendus — alternative : [score alternatif])</i>
 
 [Si avertissements présents :]
-<i>ℹ️ [Reformule l'avertissement en clair. Ex: "Attention : ces équipes ont peu de matchs joués, l'estimation est moins précise qu'à l'habitude."]</i>
+<i>ℹ️ [Reformule l'avertissement en clair, une ligne.]</i>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>📋 RÉSUMÉ DES PARIS DU JOUR</b>
 [Tous les value bets de la journée, triés par avantage décroissant.
- Si aucun → "Aucun pari recommandé aujourd'hui — le marché est bien calibré sur l'ensemble des matchs analysés."]
+ Si aucun → "Aucun pari recommandé aujourd'hui — le marché est bien calibré sur l'ensemble
+ des matchs analysés."]
 
-1. [Match] — [Victoire X / Nul] @ [cote] · Notre modèle : [X]% vs Bookmakers : [X]% · Mise : [X]%
+1. [Match] — [libellé] @ [cote] · Estimation : [X]% vs Bookmakers : [X]% · Mise : [X]%
 …
+<b>Exposition totale du jour : [somme des mises]% de bankroll</b> (plafond : 8%)
+
+<b>🎯 RÉCAP MON PETIT PRONO</b>
+[Un score par match analysé, dans l'ordre chronologique :]
+• [Éq. A] - [Éq. B] → <b>[score_conseillé]</b>
 
 <i>⚠️ Ces analyses sont à titre informatif. Ne pariez que ce que vous pouvez vous permettre de perdre.</i>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 CONSIGNES DE RÉDACTION
 ━━━━━━━━━━━━━━━━━━━━━━━━
-- heure_fr est déjà en heure française (UTC+2) — inutile de la convertir
+- heure_fr est déjà en heure française — inutile de la convertir
 - Terrain neutre (WC) : utilise les noms des équipes, jamais "domicile"/"extérieur"
-- Les % "bookmakers" dans la section probabilités = valeurs de marché_dévig (marge déjà retirée)
-- Traduis les issues : "1 (domicile)" → "Victoire [nom équipe]", "X (nul)" → "Match nul", "2 (extérieur)" → "Victoire [nom équipe]"
-- Évite tout jargon : pas de "lambda", "shrinkage", "EV", "edge", "dévigging" dans le rapport final
+- En Coupe du Monde à élimination directe : précise que nos probabilités portent sur
+  le temps réglementaire (90 minutes)
+- Évite tout jargon : pas de "lambda", "shrinkage", "EV", "edge", "blend", "devig",
+  "Dixon-Coles", "Kelly" dans le rapport final
 - Le paragraphe Analyse est OBLIGATOIRE pour chaque match — c'est la valeur ajoutée principale
 - Sois direct et factuel, évite les formulations vagues ("match équilibré", "tout est possible")
+- Reste sous ~1000 mots de rapport pour tenir dans les limites Telegram
 """
 
 
@@ -684,24 +1182,40 @@ CONSIGNES DE RÉDACTION
 # ─────────────────────────────────────────────
 
 def run_agent(max_steps: int = 60) -> None:
-    today_str     = date.today().strftime("%d/%m/%Y")
-    system_prompt = _build_system_prompt()
+    global _RUN_EXPOSURE
+    _RUN_EXPOSURE = 0.0
 
-    messages = [{
-        "role": "user",
-        "content": f"Analyse les matchs de football du {today_str} et envoie le rapport complet sur Telegram.",
-    }]
+    today_str     = _now_fr().strftime("%d/%m/%Y")
+    system_prompt = _build_system_prompt()
 
     logging.info("=" * 55)
     logging.info(f"AGENT FOOT — VALUE BETTING — {today_str}")
     logging.info("=" * 55)
- 
+
+    # Settlement des paris en attente AVANT l'analyse du jour
+    try:
+        perf_summary = settle_pending_bets()
+    except Exception as e:
+        logging.warning(f"[Perf] Settlement échoué : {e}")
+        perf_summary = ""
+    if perf_summary:
+        logging.info(f"[Perf]\n{perf_summary}")
+
+    user_msg = f"Analyse les matchs de football du {today_str} et envoie le rapport complet sur Telegram."
+    if perf_summary:
+        user_msg += (
+            "\n\nBilan de performance du modèle (à intégrer dans la section BILAN DU MODÈLE) :\n"
+            + perf_summary
+        )
+
+    messages = [{"role": "user", "content": user_msg}]
+
     for step in range(max_steps):
         logging.info(f"--- Tour {step + 1} ---")
 
         response = client.messages.create(
             model=MODEL,
-            max_tokens=8192,
+            max_tokens=16384,
             system=system_prompt,
             tools=TOOLS,
             messages=messages,
@@ -710,6 +1224,10 @@ def run_agent(max_steps: int = 60) -> None:
         for block in response.content:
             if block.type == "text" and block.text.strip():
                 logging.info(f"[Claude] {block.text}")
+
+        if response.stop_reason == "max_tokens":
+            logging.error("❌ Réponse tronquée (max_tokens) — rapport potentiellement incomplet.")
+            return
 
         if response.stop_reason != "tool_use":
             logging.info("✅ Agent terminé avec succès.")
