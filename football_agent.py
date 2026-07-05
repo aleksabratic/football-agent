@@ -29,6 +29,8 @@ Architecture de décision :
     automatique des paris en attente à chaque run + bilan (ROI, yield,
     Brier) injecté dans le rapport
   - Mon Petit Prono : score conseillé maximisant les points attendus
+    (élimination directe : distribution des scores étendue à 120 min,
+     règlement sur le score final hors tirs au but)
   - Claude s'occupe uniquement du formatage du rapport
 
 Variables d'environnement (.env) :
@@ -505,6 +507,37 @@ def _apply_elo(
 #  MON PETIT PRONO
 # ─────────────────────────────────────────────
 
+def _extend_matrix_120(m90: list[list[float]], lam_h: float, lam_a: float) -> tuple:
+    """
+    Distribution des scores après PROLONGATION (matchs à élimination directe).
+    Les scores non nuls à 90' sont définitifs ; chaque score nul se prolonge
+    avec une mini-matrice Poisson de 30 minutes (λ/3 par équipe).
+    Retourne (matrice_120, q1, qx, q2) où q* = issue de la prolongation seule
+    sachant qu'il y a prolongation (q1 = l'équipe à domicile passe devant, etc.).
+    """
+    size = len(m90)
+    lam_eh, lam_ea = lam_h / 3.0, lam_a / 3.0
+    et = [[_poisson_prob(lam_eh, a) * _poisson_prob(lam_ea, b) for b in range(size)]
+          for a in range(size)]
+    q1 = sum(et[a][b] for a in range(size) for b in range(size) if a > b)
+    qx = sum(et[a][a] for a in range(size))
+    q2 = max(0.0, 1.0 - q1 - qx)
+
+    m120 = [[0.0] * size for _ in range(size)]
+    for i in range(size):
+        for j in range(size):
+            p = m90[i][j]
+            if p == 0.0:
+                continue
+            if i != j:
+                m120[i][j] += p
+            else:
+                for a in range(size - i):
+                    for b in range(size - j):
+                        m120[i + a][j + b] += p * et[a][b]
+    return m120, q1, qx, q2
+
+
 def _mon_petit_prono(m: list[list[float]], p1: float, px: float, p2: float) -> dict:
     """
     Score à jouer sur Mon Petit Prono : maximise les points attendus.
@@ -796,18 +829,26 @@ def _sign(x: int) -> int:
 
 
 def _fetch_results(pending_ids: list[str]) -> dict[str, tuple]:
-    """Scores (90 min) des fixtures. L'endpoint accepte 20 ids par requête."""
+    """
+    Scores des fixtures : (statut, but_90_dom, but_90_ext, but_final_dom, but_final_ext).
+    - score 90 min (score.fulltime) → règlement des PARIS (règle bookmaker)
+    - score final hors tirs au but (goals, prolongation incluse) → règlement MPP
+    L'endpoint accepte 20 ids par requête.
+    """
     results: dict[str, tuple] = {}
     for i in range(0, len(pending_ids), 20):
         batch = pending_ids[i:i + 20]
         try:
             for m in _api_get("fixtures", {"ids": "-".join(batch)}):
                 status = m["fixture"]["status"]["short"]
+                tot_h, tot_a = m["goals"]["home"], m["goals"]["away"]
                 ft     = (m.get("score") or {}).get("fulltime") or {}
-                gh, ga = ft.get("home"), ft.get("away")
-                if gh is None or ga is None:
-                    gh, ga = m["goals"]["home"], m["goals"]["away"]
-                results[str(m["fixture"]["id"])] = (status, gh, ga)
+                ft_h, ft_a = ft.get("home"), ft.get("away")
+                if ft_h is None or ft_a is None:
+                    ft_h, ft_a = tot_h, tot_a
+                if tot_h is None or tot_a is None:
+                    tot_h, tot_a = ft_h, ft_a
+                results[str(m["fixture"]["id"])] = (status, ft_h, ft_a, tot_h, tot_a)
         except Exception as e:
             logging.warning(f"[Perf] Settlement impossible pour le lot {batch}: {e}")
     return results
@@ -872,7 +913,7 @@ def settle_pending_bets() -> str:
     for r in bet_rows:
         if r["résultat"] or r["fixture_id"] not in results:
             continue
-        status, gh, ga = results[r["fixture_id"]]
+        status, gh, ga, _, _ = results[r["fixture_id"]]
         if status in ("CANC", "ABD"):
             r["résultat"], r["gain_unités"] = "annulé", "0.0"
             continue
@@ -893,7 +934,8 @@ def settle_pending_bets() -> str:
     for r in mpp_rows:
         if r["résultat"] or r["fixture_id"] not in results:
             continue
-        status, gh, ga = results[r["fixture_id"]]
+        # MPP se juge sur le score final hors tirs au but (120 min si prolongation)
+        status, _, _, gh, ga = results[r["fixture_id"]]
         if status in ("CANC", "ABD"):
             r["résultat"] = "annulé"
             continue
@@ -967,11 +1009,15 @@ def get_fixtures_today() -> str:
             continue
         if m["fixture"]["status"]["short"] not in ("NS", "TBD"):
             continue  # déjà joué / en cours → inutile de pronostiquer
+        round_name = (m["league"].get("round") or "").lower()
         candidates.append({
             "fixture_id":       m["fixture"]["id"],
             "tournament":       TARGET_LEAGUES[lid],
             "league_id":        lid,
             "is_neutral_venue": lid in NEUTRAL_LEAGUES,
+            # Élimination directe (WC hors phase de groupes) : prolongation
+            # possible → Mon Petit Prono se joue sur le score à 120 min
+            "is_knockout":      lid in NEUTRAL_LEAGUES and "group" not in round_name,
             "heure_fr":         m["fixture"]["date"][11:16],
             "home_team":        m["teams"]["home"]["name"],
             "home_id":          m["teams"]["home"]["id"],
@@ -1009,6 +1055,7 @@ def get_match_analysis(
     league_id: int,
     home_team: str = "",
     away_team: str = "",
+    is_knockout: bool = False,
 ) -> str:
     """
     Analyse complète orientée value betting :
@@ -1155,13 +1202,27 @@ def get_match_analysis(
         warnings.append("Cotes non disponibles — calcul EV impossible, aucun value bet.")
 
     # ── 4. Mon Petit Prono ────────────────────────────────────────
+    # NB : les paris (1X2, O/U, BTTS) restent réglés sur 90 minutes (règle
+    # bookmaker standard) ; seul MPP se joue sur 120 min en élimination directe.
     if matrix is not None:
         blend_1x2 = (market_info.get("1X2") or {}).get("p_finale")
         if blend_1x2:
             p1b, pxb, p2b = blend_1x2["1"] / 100, blend_1x2["X"] / 100, blend_1x2["2"] / 100
         else:
             p1b, pxb, p2b = mk["p1"], mk["px"], mk["p2"]
-        mpp = _mon_petit_prono(matrix, p1b, pxb, p2b)
+        if is_knockout:
+            # MPP juge sur le score APRÈS prolongation : un nul à 90' peut
+            # devenir 2-1, et un nul à 120' (→ tirs au but) reste un nul.
+            m120, q1, qx, q2 = _extend_matrix_120(matrix, lam_h, lam_a)
+            mpp = _mon_petit_prono(
+                m120,
+                p1b + pxb * q1,   # gagne dans le temps réglementaire OU en prolongation
+                pxb * qx,         # toujours nul après 120 min (tirs au but)
+                p2b + pxb * q2,
+            )
+            mpp["décompte"] = "score après prolongation (120 min) — nul = décision aux tirs au but"
+        else:
+            mpp = _mon_petit_prono(matrix, p1b, pxb, p2b)
 
     # ── 5. QA ─────────────────────────────────────────────────────
     if home_s and (home_s["n_total"] < 5 or away_s["n_total"] < 5):
@@ -1278,6 +1339,13 @@ TOOLS = [
                     "type": "boolean",
                     "description": "true pour la Coupe du Monde (terrain neutre)",
                 },
+                "is_knockout": {
+                    "type": "boolean",
+                    "description": (
+                        "true pour un match à élimination directe (fourni par "
+                        "get_fixtures_today) — Mon Petit Prono se joue alors sur 120 min"
+                    ),
+                },
                 "league_id": {
                     "type": "integer",
                     "description": "ID de la ligue (fourni par get_fixtures_today)",
@@ -1330,6 +1398,7 @@ def execute_tool(name: str, tool_input: dict) -> str:
                     league_id        = tool_input.get("league_id", 39),
                     home_team        = tool_input.get("home_team", ""),
                     away_team        = tool_input.get("away_team", ""),
+                    is_knockout      = tool_input.get("is_knockout", False),
                 )
             case "send_telegram_report":
                 return send_telegram_report(tool_input["text"])
@@ -1358,7 +1427,7 @@ connaître les statistiques.
 1. Appelle get_fixtures_today (sans argument). La sélection des matchs est déjà faite.
 2. Si aucun match → envoie un Telegram le signalant et arrête.
 3. Pour CHAQUE match retourné : appelle get_match_analysis avec fixture_id, is_neutral_venue,
-   league_id, home_team et away_team.
+   is_knockout, league_id, home_team et away_team.
 4. Génère le rapport et appelle send_telegram_report UNE SEULE FOIS.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1454,6 +1523,8 @@ Pour CHAQUE match, reproduis exactement cette structure :
 <i>Notre estimation est trop proche des cotes du marché pour justifier un risque.</i>
 
 🎯 <b>Mon Petit Prono :</b> [score_conseillé] <i>([points_attendus] pts attendus — alternative : [score alternatif])</i>
+[Si le prono contient "décompte" (élimination directe) : ajoute
+ <i>Score prolongation incluse — un nul = décision aux tirs au but.</i>]
 
 [Si avertissements présents :]
 <i>ℹ️ [Reformule l'avertissement en clair, une ligne.]</i>
